@@ -23,9 +23,10 @@ http://s04xvtwkxqsv:3f0gsnlwbbsonwm@209.50.163.168:3129
 | 1. 注册 | `POST /v2/v4/account/auth/register`（需 Turnstile） |
 | 2. 邮箱验证 | 拉取临时邮箱验证码 → `verify-email` |
 | 3. 问卷 | 完成 `/v2/typeform` 引导（API 提交，无需手动点页面） |
-| 4. 下载代理 | 拉取 `/v2/services/premium/proxy-list/{accountId}` 对应列表 |
-| 5. 远程上传 | 目标数量**全部成功**后，`PATCH` 上传 `keys/proxies.txt` |
-| 6. Web 管理 | 浏览器查看账号、试用到期、流量剩余，并一键发起注册 |
+| 4. 激活试用 | 确认 `/me` 的 `typeform=false` 后，`POST /v2/v4/account/premium/claim-trial` |
+| 5. 下载代理 | 拉取 `/v2/services/premium/proxy-list/{accountId}` 对应列表 |
+| 6. 远程上传 | 目标数量**全部成功**后，`PATCH` 上传 `keys/proxies.txt` |
+| 7. Web 管理 | 浏览器查看账号、试用到期、流量剩余，并一键发起注册 |
 
 代理写入 **`keys/proxies.txt`（追加，不覆盖）**，适合批量多账号累积。
 
@@ -172,7 +173,17 @@ PROXY=
 PROXY_DOWNLOAD_PROTOCOL=http
 ```
 
-### 3. 远程上传（Resin，可选）
+### 3. 免费试用激活（自动）
+
+邮箱验证与 onboarding 问卷都完成，并且 `/me` 确认 `typeform=false` 后，程序会使用该账号当前运行期的 `access_token` 调用：
+
+```text
+POST /v2/v4/account/premium/claim-trial
+```
+
+此步骤不需要在 `.env` 配置额外 Token、Cookie 或浏览器请求头；激活失败会将账号标记为 `NO_PREMIUM_TRIAL`，且不会继续下载代理。
+
+### 4. 远程上传（Resin，可选）
 
 批量**全部成功**后自动执行：
 
@@ -279,6 +290,8 @@ echo 5 | python main.py
 [+] 邮箱验证成功
 [*] 开始 onboarding 问卷 ...
 [+] 问卷完成
+[*] 激活 Premium 免费试用...
+[+] Premium 免费试用已激活
 [*] 下载 proxy-list | format=protocol://user:pass@host:port
 [✓] 代理下载成功: ... | 100 条
 ...
@@ -328,7 +341,7 @@ python -c "from main import upload_proxies_to_resin; print(upload_proxies_to_res
 
 ```text
 ProxyScrape/
-├── main.py                 # 注册 + 验证 + 问卷 + 下载 + 远程上传
+├── main.py                 # 注册 + 验证 + 问卷 + 激活试用 + 下载 + 远程上传
 ├── web_app.py              # Web 管理台（账号 / 到期 / 流量 / 注册）
 ├── download_proxies.py     # 已有账号单独下载代理
 ├── api_solver.py           # 本地 Turnstile Solver
@@ -345,7 +358,9 @@ ProxyScrape/
 │   └── proxyscrape_helpers.py
 └── tests/
     ├── test_proxyscrape_helpers.py
-    └── test_account_web_helpers.py
+    ├── test_premium_trial_claim.py
+    ├── test_account_web_helpers.py
+    └── test_env_config.py
 ```
 
 ---
@@ -353,7 +368,7 @@ ProxyScrape/
 ## 单元测试
 
 ```bash
-python -m unittest tests.test_proxyscrape_helpers -v
+python -m unittest discover -s tests -v
 ```
 
 ---
@@ -378,7 +393,7 @@ python -m unittest tests.test_proxyscrape_helpers -v
 
 ### 代理下载为空
 
-- 确认问卷已完成（`/me` 中 `typeform=false`）
+- 确认问卷已完成（`/me` 中 `typeform=false`）且 Premium 免费试用已成功激活
 - 试用一般为 **HTTP only**，`PROXY_DOWNLOAD_PROTOCOL=http`
 - 检查 token 是否过期
 

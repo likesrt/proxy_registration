@@ -13,6 +13,7 @@ from src.proxyscrape_helpers import (
     TURNSTILE_SITEKEY,
     TYPEFORM_FORM_ID,
     TYPEFORM_ENDPOINT,
+    PREMIUM_TRIAL_CLAIM_ENDPOINT,
     CREDENTIAL_FORMAT_PROTOCOL_URL,
     generate_register_password,
     password_meets_rules,
@@ -168,6 +169,10 @@ class TestRegisterProtocolHelpers(unittest.TestCase):
         self.assertEqual(TYPEFORM_FORM_ID, "vnCgUn0n")
         self.assertTrue(fields["response_id"])
         self.assertIn("typeform", TYPEFORM_ENDPOINT)
+        self.assertEqual(
+            PREMIUM_TRIAL_CLAIM_ENDPOINT,
+            "https://dashboard.proxyscrape.com/v2/v4/account/premium/claim-trial",
+        )
         fixed = build_typeform_complete_fields(response_id="abc123")
         self.assertEqual(fixed["response_id"], "abc123")
 
@@ -309,6 +314,9 @@ class TestMainModuleNoGrok(unittest.TestCase):
         self.assertIn("/v2/v4/account/auth/register", src)
         self.assertIn("typeform", src)
         self.assertIn("complete_typeform_onboarding", src)
+        self.assertIn("claim_premium_trial", src)
+        self.assertIn("PREMIUM_TRIAL_CLAIM_ENDPOINT", src)
+        self.assertIn("NO_PREMIUM_TRIAL", src)
         self.assertIn("download_premium_proxies", src)
         self.assertIn("LOGIN_ENDPOINT", src)
         self.assertIn("login_http", src)

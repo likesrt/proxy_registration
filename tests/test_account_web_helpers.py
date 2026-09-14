@@ -70,6 +70,12 @@ class TestParseAccountLine(unittest.TestCase):
         self.assertIn("UNVERIFIED", acc["flags"])
         self.assertEqual(acc["access_token"], "tok")
 
+    def test_premium_trial_flag_on_token(self):
+        line = "a@b.com----p----tok----NO_PREMIUM_TRIAL"
+        acc = parse_account_line(line)
+        self.assertIn("NO_PREMIUM_TRIAL", acc["flags"])
+        self.assertEqual(acc["access_token"], "tok")
+
     def test_jwt_ending_with_hyphen_plus_unverified_roundtrip(self):
         """Markers must not strip('-') — base64url JWT may end with '-'."""
         # Synthetic JWT-shaped token ending with '-' (base64url)

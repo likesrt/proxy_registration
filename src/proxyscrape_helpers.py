@@ -17,6 +17,7 @@ LOGIN_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/auth/login"
 VERIFY_EMAIL_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/verify-email"
 RESEND_CODE_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/reset-verification-code"
 TYPEFORM_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/typeform"
+PREMIUM_TRIAL_CLAIM_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/premium/claim-trial"
 ME_ENDPOINT = "https://dashboard.proxyscrape.com/v2/v4/account/auth/me"
 # Post-verify onboarding (typeform embed vnCgUn0n → then dashboard)
 TYPEFORM_PAGE = "https://dashboard.proxyscrape.com/v2/typeform"
@@ -633,6 +634,7 @@ _ACCOUNT_LINE_MARKERS = frozenset(
     {
         "UNVERIFIED",
         "NO_TYPEFORM",
+        "NO_PREMIUM_TRIAL",
         "NO_ACCOUNT_ID",
         "NO_PROXIES",
     }

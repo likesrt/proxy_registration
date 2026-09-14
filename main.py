@@ -29,6 +29,7 @@ from src.proxyscrape_helpers import (
     VERIFY_EMAIL_ENDPOINT,
     RESEND_CODE_ENDPOINT,
     TYPEFORM_ENDPOINT,
+    PREMIUM_TRIAL_CLAIM_ENDPOINT,
     ME_ENDPOINT,
     TYPEFORM_FORM_ID,
     TURNSTILE_SITEKEY,
@@ -653,6 +654,43 @@ def complete_typeform_onboarding(session, access_token: str) -> dict:
     }
 
 
+def claim_premium_trial(session, access_token: str) -> dict:
+    """Activate the eligible account's Premium free trial after onboarding."""
+    headers = _auth_headers(access_token)
+    headers.pop("Content-Type", None)
+    headers["referer"] = "https://dashboard.proxyscrape.com/v2/overview"
+    try:
+        res = session.post(
+            PREMIUM_TRIAL_CLAIM_ENDPOINT,
+            headers=headers,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "status": 0, "message": str(e), "data": None}
+
+    try:
+        body = res.json()
+    except Exception:
+        body = {"raw": res.text[:500]}
+
+    ok = (
+        200 <= res.status_code < 300
+        and isinstance(body, dict)
+        and body.get("success") is True
+    )
+    message = ""
+    if isinstance(body, dict):
+        message = body.get("message") or body.get("error") or (
+            "ok" if ok else str(body)[:200]
+        )
+    return {
+        "ok": ok,
+        "status": res.status_code,
+        "message": message or f"HTTP {res.status_code}",
+        "data": body,
+    }
+
+
 def fetch_inbox_content(email_service, jwt, email: str, email_service_type: str):
     try:
         if email_service_type == "gptmail":
@@ -910,7 +948,24 @@ def register_accounts():
                 else:
                     print(f"[*] {email} onboarding 问卷已完成，跳过")
 
-                # Step 5: Download premium proxy list (primary deliverable)
+                # Step 5: Activate the supported Premium free-trial API.
+                # This only runs after /me has confirmed onboarding is complete.
+                print(f"[*] {email} 激活 Premium 免费试用...")
+                cres = claim_premium_trial(session, access_token)
+                if not cres["ok"]:
+                    print(
+                        f"[-] {email} 免费试用激活失败 ({cres['status']}): "
+                        f"{cres['message']}"
+                    )
+                    paths = save_account_credentials(
+                        email, password, access_token, extra="NO_PREMIUM_TRIAL"
+                    )
+                    print(f"[~] 未激活免费试用账号 -> {paths['accounts']}")
+                    time.sleep(3)
+                    continue
+                print(f"[+] {email} Premium 免费试用已激活: {cres['message']}")
+
+                # Step 6: Download premium proxy list (primary deliverable)
                 # Page: /v2/services/premium/proxy-list/{accountId}
                 # Format: protocol://user:pass@host:port  (credential_format=3)
                 me_final = fetch_account_me(session, access_token) or {}

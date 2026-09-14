@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,14 +60,16 @@ class TestEnvConfig(unittest.TestCase):
             path = os.path.join(td, ".env")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("RESIN_NAME=MyName\nADMIN_PASSWORD=secret\n")
-            data = get_config_for_ui(path, include_secrets=True)
-            self.assertTrue(data["exists"])
-            self.assertEqual(data["values"].get("RESIN_NAME"), "MyName")
-            self.assertEqual(data["values"].get("ADMIN_PASSWORD"), "secret")
-            self.assertTrue(data["secrets_set"].get("ADMIN_PASSWORD"))
-            masked = get_config_for_ui(path, include_secrets=False)
-            self.assertEqual(masked["values"].get("ADMIN_PASSWORD"), "")
-            self.assertTrue(masked["secrets_set"].get("ADMIN_PASSWORD"))
+            # Isolate this temporary file from values loaded from the project's .env.
+            with patch.dict(os.environ, {}, clear=True):
+                data = get_config_for_ui(path, include_secrets=True)
+                self.assertTrue(data["exists"])
+                self.assertEqual(data["values"].get("RESIN_NAME"), "MyName")
+                self.assertEqual(data["values"].get("ADMIN_PASSWORD"), "secret")
+                self.assertTrue(data["secrets_set"].get("ADMIN_PASSWORD"))
+                masked = get_config_for_ui(path, include_secrets=False)
+                self.assertEqual(masked["values"].get("ADMIN_PASSWORD"), "")
+                self.assertTrue(masked["secrets_set"].get("ADMIN_PASSWORD"))
 
     def test_secret_true_without_password_type_in_schema(self):
         """Fields with only secret:True (type text) must still be treated as secrets."""
