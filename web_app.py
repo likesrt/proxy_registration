@@ -399,8 +399,40 @@ _AUTO_REGISTER_MAX_BACKOFF = 6
 _AUTO_REGISTER_DISABLED_POLL = 60.0
 
 _scheduler_stop = threading.Event()
+# Sleep primitive of _auto_register_loop. Setting it makes the loop re-read its
+# config and recompute its wait right away, instead of staying asleep until the
+# end of a wait measured in hours (POST /api/config, POST /api/register/check-now).
+_scheduler_wake = threading.Event()
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
+
+# Last state published by the scheduler loop, read by GET /api/register/status.
+# The status route is polled every 2s and must never touch keys/ (a full file
+# scan), so it only ever reads this cache.
+_auto_register_state: dict = {
+    "enabled": None,
+    "interval": None,
+    "target": None,
+    "min_valid": None,
+    "next_run_at": None,
+    "last_action": None,
+    "last_have": None,
+    # internal: last config snapshot we logged a line for (transition logging)
+    "logged_config": None,
+    # internal: None until the loop has completed one decision
+    "tick_at": None,
+}
+_auto_register_state_lock = threading.Lock()
+
+_AUTO_REGISTER_STATUS_KEYS = (
+    "enabled",
+    "interval",
+    "target",
+    "min_valid",
+    "next_run_at",
+    "last_action",
+    "last_have",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -429,6 +461,81 @@ def _count_feed_eligible() -> Optional[int]:
     except Exception as e:
         _append_log(f"[-] [auto] 统计可供给账号失败: {str(e)[:160]}")
         return None
+
+
+def _auto_register_signature(cfg: dict) -> tuple:
+    """The parts of cfg worth telling the user about when they change."""
+    return (
+        bool(cfg["enabled"]),
+        int(cfg["interval"]),
+        int(cfg["min_valid"]),
+        int(cfg["target"]),
+    )
+
+
+def _format_auto_register_signature(sig: tuple) -> str:
+    enabled, interval, min_valid, target = sig
+    return (
+        f"enabled={'true' if enabled else 'false'} interval={interval}s "
+        f"min_valid={min_valid} target={target}"
+    )
+
+
+def get_auto_register_status() -> dict:
+    """Cached scheduler state for the UI.
+
+    Safe to call on every poll: it never calls _count_feed_eligible() /
+    collect_valid_proxy_lines(), which scan keys/ on every invocation. Before
+    the loop's first decision every field is None rather than a guess.
+    """
+    with _auto_register_state_lock:
+        state = dict(_auto_register_state)
+    if state.get("tick_at") is None:
+        return {k: None for k in _AUTO_REGISTER_STATUS_KEYS}
+    return {k: state.get(k) for k in _AUTO_REGISTER_STATUS_KEYS}
+
+
+def _publish_auto_register_state(
+    cfg: dict, action: str, have: Optional[int], next_run_at: Optional[float]
+) -> None:
+    with _auto_register_state_lock:
+        _auto_register_state.update(
+            {
+                "enabled": bool(cfg["enabled"]),
+                "interval": int(cfg["interval"]),
+                "target": int(cfg["target"]),
+                "min_valid": int(cfg["min_valid"]),
+                "next_run_at": next_run_at,
+                "last_action": action,
+                "last_have": have if isinstance(have, int) else None,
+                "tick_at": time.time(),
+            }
+        )
+
+
+def _log_auto_register_transition(cfg: dict, action: str, have: Optional[int]) -> None:
+    """Log once when the scheduler's effective config changes, never per tick.
+
+    A disabled scheduler ticks every _AUTO_REGISTER_DISABLED_POLL seconds and an
+    enabled one every AUTO_REGISTER_INTERVAL (hours to days); logging each tick
+    would bury the log. The last decision is still recorded in state/status.
+    """
+    sig = _auto_register_signature(cfg)
+    with _auto_register_state_lock:
+        previous = _auto_register_state.get("logged_config")
+        _auto_register_state["logged_config"] = sig
+    if previous == sig:
+        return
+    decision = f"决定={action}" + (
+        f"(可供给={have})" if isinstance(have, int) else ""
+    )
+    if previous is None:
+        _append_log(f"[*] [auto] 调度配置 {_format_auto_register_signature(sig)} · {decision}")
+    else:
+        _append_log(
+            f"[*] [auto] 配置变更 {_format_auto_register_signature(previous)} → "
+            f"{_format_auto_register_signature(sig)} · {decision}"
+        )
 
 
 def _maybe_auto_register_once() -> dict:
@@ -477,7 +584,12 @@ def _wait_for_register_job(timeout: float = 6 * 3600.0, poll: float = 2.0) -> No
 def _auto_register_loop() -> None:
     backoff = 1
     while not _scheduler_stop.is_set():
-        interval = _auto_register_config()["interval"]
+        # Consume any wake that arrived while we were deciding: the config read
+        # below already sees it, so honouring it again would just re-decide the
+        # same thing (and must not double-log).
+        _scheduler_wake.clear()
+        cfg = _auto_register_config()
+        interval = cfg["interval"]
         wait = float(interval)
         try:
             result = _maybe_auto_register_once()
@@ -486,14 +598,21 @@ def _auto_register_loop() -> None:
             result = {"action": "error"}
 
         action = result.get("action")
+        have = result.get("have")
         if action == "disabled":
             # Cheap no-op tick so flipping AUTO_REGISTER_ENABLED takes effect soon.
             wait = min(float(interval), _AUTO_REGISTER_DISABLED_POLL)
-        elif action == "started":
+
+        if action == "started":
+            # A round is running: nothing is scheduled until it finishes.
+            _publish_auto_register_state(cfg, action, have, None)
+        _log_auto_register_transition(cfg, action, have)
+
+        if action == "started":
             # Backoff: register_accounts() returns immediately when the Turnstile
             # solver is unavailable, so a round that does not raise the usable
             # account count must slow down instead of spinning every interval.
-            before = result.get("have")
+            before = have
             _wait_for_register_job()
             after = _count_feed_eligible()
             if before is not None and after is not None and after > before:
@@ -506,8 +625,10 @@ def _auto_register_loop() -> None:
                 )
             wait = float(interval) * backoff
 
-        if _scheduler_stop.wait(wait):
-            return
+        _publish_auto_register_state(cfg, action, have, time.time() + wait)
+        # Sleep until the wait elapses or someone asks us to re-read config.
+        _scheduler_wake.wait(wait)
+        _scheduler_wake.clear()
 
 
 def _start_auto_register_scheduler() -> bool:
@@ -518,6 +639,7 @@ def _start_auto_register_scheduler() -> bool:
             return False
         _scheduler_started = True
     _scheduler_stop.clear()
+    _scheduler_wake.clear()
     threading.Thread(
         target=_auto_register_loop, name="auto-register", daemon=True
     ).start()
@@ -642,6 +764,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button type="button" class="danger" id="btnStop" disabled>停止</button>
       </div>
       <p class="status" id="regStatus">注册状态: idle</p>
+      <div class="row" style="margin-top:0.35rem">
+        <span class="status" id="autoRegStatus">自动补齐: —</span>
+        <button type="button" class="secondary" id="btnCheckNow">立即检查</button>
+      </div>
       <p class="muted" style="margin:0.5rem 0 0;font-size:0.8rem">
         调用与 CLI 相同的 <code>main.register_accounts</code> 路径（需本地 Turnstile Solver）。
       </p>
@@ -816,6 +942,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <td>${flagTags(row)}</td>
           <td class="row">
             <button type="button" data-act="download" data-i="${i}">下载</button>
+            <button type="button" class="secondary" data-act="copy-pass" data-i="${i}">复制密码</button>
             <button type="button" class="secondary" data-act="refresh" data-i="${i}">刷新</button>
             <button type="button" class="danger" data-act="delete" data-i="${i}">删除</button>
           </td>
@@ -898,6 +1025,44 @@ INDEX_HTML = r"""<!DOCTYPE html>
         alert(e.message);
         appendLogLines([`[-] 下载 ${email} proxy 失败: ${e.message}`]);
       }
+    }
+
+    /** Copy text, with a manual fallback for non-secure contexts. */
+    async function copyText(text) {
+      // The console is usually opened over plain HTTP on a LAN, where
+      // navigator.clipboard is undefined — do not rely on it alone.
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (_) {}
+      }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand && document.execCommand("copy");
+        ta.remove();
+        if (ok) return true;
+      } catch (_) {}
+      window.prompt("浏览器不允许自动复制，请手动复制：", text);
+      return false;
+    }
+
+    async function copyAccountPassword(email, password) {
+      if (!password) {
+        appendLogLines([`[-] ${email} 没有可用的密码`]);
+        alert("该账号没有保存密码");
+        return;
+      }
+      const ok = await copyText(String(password));
+      appendLogLines([
+        ok ? `[✓] 已复制 ${email} 的密码` : `[!] 已弹出 ${email} 的密码，请手动复制`
+      ]);
     }
 
     async function downloadAllProxies() {
@@ -1092,6 +1257,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         finally { btn.disabled = false; }
         return;
       }
+      if (btn.dataset.act === "copy-pass") {
+        await copyAccountPassword(row.email, row.password);
+        return;
+      }
       if (btn.dataset.act === "delete") {
         await deleteAccount(row.email);
         return;
@@ -1113,6 +1282,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
     };
 
+    /** Local clock time (HH:MM:SS) from a unix timestamp — matches the browser. */
+    function formatClock(unixSec) {
+      if (unixSec == null || unixSec === "") return "—";
+      const d = new Date(Number(unixSec) * 1000);
+      if (isNaN(d.getTime())) return "—";
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+
+    /** Next check time; date-prefixed when it is not today (intervals are hours/days). */
+    function formatNextRun(unixSec) {
+      const clock = formatClock(unixSec);
+      if (clock === "—") return clock;
+      const d = new Date(Number(unixSec) * 1000);
+      const now = new Date();
+      const sameDay =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      if (sameDay) return clock;
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${clock}`;
+    }
+
+    function formatInterval(sec) {
+      const s = Number(sec);
+      if (!isFinite(s) || s <= 0) return "—";
+      if (s >= 3600 && s % 3600 === 0) return `${s / 3600} 小时`;
+      if (s >= 60 && s % 60 === 0) return `${s / 60} 分钟`;
+      return `${s} 秒`;
+    }
+
+    const AUTO_ACTION_TEXT = {
+      disabled: "已关闭",
+      enough: "数量充足",
+      busy: "有任务在跑",
+      started: "已开始补齐",
+      error: "统计失败",
+    };
+
+    function renderAutoRegisterStatus(s) {
+      const ar = (s && s.auto_register) || null;
+      const el = $("autoRegStatus");
+      if (!ar || ar.enabled == null) {
+        el.textContent = "自动补齐: —";
+        el.title = "";
+        return;
+      }
+      let line = ar.enabled ? "自动补齐: 开" : "自动补齐: 关";
+      if (ar.enabled) {
+        const next = ar.next_run_at != null
+          ? formatNextRun(ar.next_run_at)
+          : (s.running ? "本轮注册中" : "—");
+        line += ` · 下次检查 ${next}`;
+      }
+      if (ar.last_action) {
+        line += ` · 上次: ${AUTO_ACTION_TEXT[ar.last_action] || ar.last_action}`;
+        if (ar.last_have != null) line += `(${ar.last_have})`;
+      }
+      el.textContent = line;
+      el.title = `间隔 ${formatInterval(ar.interval)} · 目标 ${ar.target} · 下限 ${ar.min_valid}`;
+    }
+
     async function pollReg() {
       try {
         const s = await api("/api/register/status");
@@ -1121,8 +1353,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
           (s.running ? ` · CLI success=${s.cli_success}/${s.cli_target}` : "");
         $("btnRegister").disabled = !!s.running;
         $("btnStop").disabled = !s.running;
+        renderAutoRegisterStatus(s);
       } catch (_) {}
     }
+
+    $("btnCheckNow").onclick = async () => {
+      $("btnCheckNow").disabled = true;
+      try {
+        const r = await api("/api/register/check-now", { method: "POST" });
+        appendLogLines([`[✓] ${r.message || "已触发调度器立即检查"}`]);
+        pollReg();
+      } catch (e) { alert(e.message); }
+      finally { $("btnCheckNow").disabled = false; }
+    };
 
     $("btnRegister").onclick = async () => {
       const count = Math.max(1, parseInt($("regCount").value || "1", 10));
@@ -1510,6 +1753,9 @@ async def api_config_save():
     result = upsert_env_file(updates, path=DEFAULT_ENV_PATH, keys_allowlist=list(allow))
     apply_updates_to_environ(updates)
     reloaded = reload_main_module_config(reg)
+    # Wake the scheduler so AUTO_REGISTER_* changes apply now instead of after a
+    # wait measured in hours. It re-reads the env itself and re-logs/re-waits.
+    _scheduler_wake.set()
 
     restart_hint = None
     if "WEB_HOST" in updates or "WEB_PORT" in updates:
@@ -1727,6 +1973,18 @@ async def api_register_stop():
     return jsonify({"ok": True, "message": "stop_flag set"})
 
 
+@app.post("/api/register/check-now")
+async def api_register_check_now():
+    """Ask the scheduler to re-read its config and re-decide right now.
+
+    Only sets the wake event — the decision itself stays in _auto_register_loop
+    so there is exactly one implementation of it.
+    """
+    _scheduler_wake.set()
+    _append_log("[*] [auto] 已触发立即检查")
+    return jsonify({"ok": True, "message": "已触发调度器立即检查"})
+
+
 @app.get("/api/register/status")
 async def api_register_status():
     return jsonify(
@@ -1739,6 +1997,8 @@ async def api_register_status():
             "finished_at": _register_job["finished_at"],
             "cli_success": getattr(reg, "success_count", 0),
             "cli_target": getattr(reg, "target_count", 0),
+            # Cached by the scheduler loop — never scanned here (2s polling).
+            "auto_register": get_auto_register_status(),
         }
     )
 

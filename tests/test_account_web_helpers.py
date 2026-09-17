@@ -504,6 +504,18 @@ class TestWebAppSource(unittest.TestCase):
         self.assertNotIn("刷新详情", src)
         self.assertNotIn("账号详情", src)
 
+    def test_password_is_reachable_from_the_table(self):
+        """The API already returns password; the UI must be able to read it."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "web_app.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("row.password", src)
+        self.assertIn('data-act="copy-pass"', src)
+        self.assertIn(">复制密码</button>", src)
+        # LAN console over plain HTTP: navigator.clipboard is undefined there,
+        # so a manual fallback is required, not optional.
+        self.assertIn('window.prompt("浏览器不允许自动复制', src)
+
 
 if __name__ == "__main__":
     unittest.main()

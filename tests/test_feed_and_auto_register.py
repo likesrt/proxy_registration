@@ -1,8 +1,10 @@
 """Route + scheduler tests for the proxy feed and auto top-up registration."""
 import os
 import sys
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -263,7 +265,12 @@ class TestFeedSource(unittest.TestCase):
 
 
 class _FakeStop:
-    """Event stand-in that records wait() durations and stops after N of them."""
+    """Event stand-in that records wait() durations and stops after N of them.
+
+    Patched over both _scheduler_stop and _scheduler_wake: the loop waits on the
+    wake event and consults the stop event to exit, so one double covering both
+    still captures the wait durations the backoff tests assert on.
+    """
 
     def __init__(self, max_waits):
         self.waits = []
@@ -373,6 +380,8 @@ class TestAutoRegisterBackoff(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(
             web_app, "_scheduler_stop", stop
         ), patch.object(
+            web_app, "_scheduler_wake", stop
+        ), patch.object(
             web_app, "_maybe_auto_register_once", side_effect=list(decisions)
         ), patch.object(
             web_app, "collect_valid_proxy_lines", side_effect=list(counts)
@@ -440,6 +449,284 @@ class TestSchedulerWiring(unittest.TestCase):
             self.assertEqual(thread.call_count, 1)
         finally:
             web_app._scheduler_started = False
+
+
+CFG = {
+    "enabled": True,
+    "interval": 21600,
+    "target": 50,
+    "min_valid": 10,
+    "max_per_round": 20,
+}
+
+
+def _reset_auto_register_state():
+    """Back to 'no tick yet' — the cache is module-global and shared by tests."""
+    with web_app._auto_register_state_lock:
+        for key in web_app._auto_register_state:
+            web_app._auto_register_state[key] = None
+
+
+class _StateMixin:
+    def setUp(self):
+        with web_app._auto_register_state_lock:
+            self._saved_state = dict(web_app._auto_register_state)
+        _reset_auto_register_state()
+
+    def tearDown(self):
+        with web_app._auto_register_state_lock:
+            web_app._auto_register_state.update(self._saved_state)
+
+
+class TestAutoRegisterStatusRoute(_StateMixin, unittest.IsolatedAsyncioTestCase):
+    """GET /api/register/status must expose cached scheduler state, never scan."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = web_app.app.test_client()
+
+    async def _status(self):
+        with patch.object(web_app, "_is_authed", return_value=True):
+            r = await self.client.get("/api/register/status")
+            return r, await r.get_json()
+
+    async def test_before_any_tick_fields_are_null_not_a_scan(self):
+        with patch.object(
+            web_app, "collect_valid_proxy_lines", side_effect=AssertionError("scanned")
+        ), patch.object(
+            web_app, "_count_feed_eligible", side_effect=AssertionError("scanned")
+        ):
+            r, body = await self._status()
+        self.assertEqual(r.status_code, 200)
+        ar = body["auto_register"]
+        self.assertEqual(set(ar), set(web_app._AUTO_REGISTER_STATUS_KEYS))
+        # no tick yet: unknown, not guessed and not measured
+        self.assertTrue(all(v is None for v in ar.values()))
+
+    async def test_reports_cached_values_without_rescanning(self):
+        web_app._publish_auto_register_state(CFG, "enough", 99, 1_800_000_000.0)
+        with patch.object(
+            web_app, "collect_valid_proxy_lines", side_effect=AssertionError("scanned")
+        ), patch.object(
+            web_app, "_count_feed_eligible", side_effect=AssertionError("scanned")
+        ):
+            _, body = await self._status()
+        ar = body["auto_register"]
+        self.assertTrue(ar["enabled"])
+        self.assertEqual(ar["interval"], 21600)
+        self.assertEqual(ar["target"], 50)
+        self.assertEqual(ar["min_valid"], 10)
+        self.assertEqual(ar["next_run_at"], 1_800_000_000.0)
+        self.assertEqual(ar["last_action"], "enough")
+        self.assertEqual(ar["last_have"], 99)
+
+    async def test_next_run_at_is_null_while_a_round_is_running(self):
+        web_app._publish_auto_register_state(CFG, "started", 3, None)
+        _, body = await self._status()
+        ar = body["auto_register"]
+        self.assertIsNone(ar["next_run_at"])
+        self.assertEqual(ar["last_action"], "started")
+        self.assertEqual(ar["last_have"], 3)
+
+    async def test_status_route_requires_login(self):
+        r = await self.client.get("/api/register/status")
+        self.assertEqual(r.status_code, 401)
+
+
+class TestAutoRegisterTransitionLog(_StateMixin, unittest.TestCase):
+    """One line per meaningful change — never one per tick."""
+
+    def setUp(self):
+        super().setUp()
+        web_app._clear_logs()
+
+    def _lines(self):
+        return web_app._get_logs(0)["lines"]
+
+    def test_first_tick_logs_once_then_repeats_are_silent(self):
+        web_app._log_auto_register_transition(dict(CFG), "enough", 99)
+        lines = self._lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("interval=21600s", lines[0])
+        self.assertIn("决定=enough(可供给=99)", lines[0])
+
+        # A disabled scheduler ticks every 60s and an enabled one every
+        # interval; neither may log while nothing changed.
+        for _ in range(5):
+            web_app._log_auto_register_transition(dict(CFG), "enough", 99)
+        self.assertEqual(len(self._lines()), 1)
+
+    def test_enabled_to_disabled_logs_both_sides_once(self):
+        web_app._log_auto_register_transition(dict(CFG), "enough", 99)
+        off = dict(CFG, enabled=False)
+        web_app._log_auto_register_transition(off, "disabled", None)
+        lines = self._lines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("配置变更", lines[1])
+        self.assertIn("enabled=true", lines[1])
+        self.assertIn("enabled=false", lines[1])
+        self.assertIn("决定=disabled", lines[1])
+
+        web_app._log_auto_register_transition(dict(off), "disabled", None)
+        self.assertEqual(len(self._lines()), 2)
+
+    def test_disabled_to_enabled_logs(self):
+        web_app._log_auto_register_transition(dict(CFG, enabled=False), "disabled", None)
+        self.assertEqual(len(self._lines()), 1)
+        web_app._log_auto_register_transition(dict(CFG), "enough", 5)
+        lines = self._lines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("enabled=false", lines[1])
+        self.assertIn("enabled=true", lines[1])
+
+    def test_each_tracked_field_logs_when_it_changes(self):
+        for field, value in (
+            ("interval", 3600),
+            ("min_valid", 25),
+            ("target", 80),
+        ):
+            with self.subTest(field=field):
+                _reset_auto_register_state()
+                web_app._clear_logs()
+                web_app._log_auto_register_transition(dict(CFG), "enough", 1)
+                web_app._log_auto_register_transition(
+                    dict(CFG, **{field: value}), "enough", 1
+                )
+                self.assertEqual(len(self._lines()), 2)
+
+    def test_decision_is_recorded_even_when_nothing_is_logged(self):
+        web_app._log_auto_register_transition(dict(CFG), "enough", 7)
+        web_app._publish_auto_register_state(CFG, "enough", 7, 1.0)
+        # a different decision with an unchanged config: state only, no line
+        web_app._publish_auto_register_state(CFG, "busy", 7, None)
+        web_app._log_auto_register_transition(dict(CFG), "busy", 7)
+        self.assertEqual(len(self._lines()), 1)
+        st = web_app.get_auto_register_status()
+        self.assertEqual(st["last_action"], "busy")
+        self.assertEqual(st["last_have"], 7)
+
+    def test_silent_loop_branches_do_not_spam_the_log(self):
+        stop = _FakeStop(4)
+        with patch.dict(os.environ, {"AUTO_REGISTER_INTERVAL": "21600"}), patch.object(
+            web_app, "_scheduler_stop", stop
+        ), patch.object(
+            web_app, "_scheduler_wake", stop
+        ), patch.object(
+            web_app, "_maybe_auto_register_once", return_value={"action": "enough", "have": 99}
+        ):
+            web_app._auto_register_loop()
+        auto_lines = [ln for ln in self._lines() if "[auto]" in ln]
+        self.assertEqual(len(auto_lines), 1)
+        self.assertEqual(stop.waits, [21600.0] * 4)
+
+
+class TestSchedulerWake(unittest.TestCase):
+    """Change C': a config save must cut the sleep short, without polling slices."""
+
+    def test_long_interval_is_waited_in_one_piece(self):
+        stop = _FakeStop(1)
+        env = {"AUTO_REGISTER_ENABLED": "true", "AUTO_REGISTER_INTERVAL": "21600"}
+        with patch.dict(os.environ, env), patch.object(
+            web_app, "_scheduler_stop", stop
+        ), patch.object(
+            web_app, "_scheduler_wake", stop
+        ), patch.object(
+            web_app, "_maybe_auto_register_once",
+            return_value={"action": "enough", "have": 99},
+        ):
+            web_app._auto_register_loop()
+        # one 6h wait, not 360 x 60s polls
+        self.assertEqual(stop.waits, [21600.0])
+
+    def test_wake_cuts_a_six_hour_wait_short(self):
+        with web_app._auto_register_state_lock:
+            saved_state = dict(web_app._auto_register_state)
+        _reset_auto_register_state()
+        web_app._scheduler_stop.clear()
+        web_app._scheduler_wake.clear()
+        decision = Mock(return_value={"action": "enough", "have": 99})
+        worker = None
+        try:
+            with patch.dict(
+                os.environ,
+                {"AUTO_REGISTER_ENABLED": "true", "AUTO_REGISTER_INTERVAL": "21600"},
+            ), patch.object(web_app, "_maybe_auto_register_once", decision):
+                worker = threading.Thread(
+                    target=web_app._auto_register_loop, name="test-auto-register", daemon=True
+                )
+                worker.start()
+                self.assertTrue(self._wait_until(lambda: decision.call_count >= 1))
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: web_app.get_auto_register_status()["next_run_at"] is not None
+                    )
+                )
+                next_run_at = web_app.get_auto_register_status()["next_run_at"]
+                self.assertGreater(next_run_at - time.time(), 3600 * 5)
+
+                # this is what POST /api/config does
+                started = time.time()
+                web_app._scheduler_wake.set()
+                self.assertTrue(self._wait_until(lambda: decision.call_count >= 2))
+                elapsed = time.time() - started
+            self.assertLess(elapsed, 2.0)
+        finally:
+            web_app._scheduler_stop.set()
+            web_app._scheduler_wake.set()
+            if worker is not None:
+                worker.join(timeout=5)
+            web_app._scheduler_stop.clear()
+            web_app._scheduler_wake.clear()
+            with web_app._auto_register_state_lock:
+                web_app._auto_register_state.update(saved_state)
+
+    def test_config_save_sets_the_wake_event(self):
+        web_app._scheduler_wake.clear()
+        with patch.object(web_app, "upsert_env_file", return_value={"updated": ["AUTO_REGISTER_ENABLED"]}), patch.object(
+            web_app, "apply_updates_to_environ"
+        ), patch.object(web_app, "reload_main_module_config", return_value=[]), patch.object(
+            web_app, "_is_authed", return_value=True
+        ):
+            client = web_app.app.test_client()
+            r = await_result(
+                client.post(
+                    "/api/config",
+                    json={"values": {"AUTO_REGISTER_ENABLED": "true"}},
+                )
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(web_app._scheduler_wake.is_set())
+        web_app._scheduler_wake.clear()
+
+    def test_check_now_route_sets_the_wake_event(self):
+        web_app._scheduler_wake.clear()
+        with patch.object(web_app, "_is_authed", return_value=True):
+            client = web_app.app.test_client()
+            r = await_result(client.post("/api/register/check-now"))
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(web_app._scheduler_wake.is_set())
+        web_app._scheduler_wake.clear()
+
+    def test_check_now_route_requires_login(self):
+        client = web_app.app.test_client()
+        r = await_result(client.post("/api/register/check-now"))
+        self.assertEqual(r.status_code, 401)
+
+    @staticmethod
+    def _wait_until(predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
+
+
+def await_result(awaitable):
+    """Run a Quart test-client coroutine from a plain unittest.TestCase."""
+    import asyncio
+
+    return asyncio.run(awaitable)
 
 
 if __name__ == "__main__":
