@@ -1,0 +1,35 @@
+services:
+  solver:
+    image: proxy-registration:local
+    build:
+      context: .
+      args:
+        REPO_URL: https://github.com/aizhiqian/proxy_registration
+        REPO_REF: main
+        # GITHUB_TOKEN: ""     # 仓库为私有时才需要
+    command: ["python", "api_solver.py", "--browser_type", "camoufox",
+              "--thread", "2"]
+    restart: unless-stopped
+    mem_limit: 4g
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5072/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  app:
+    image: proxy-registration:local
+    command: ["python", "web_app.py"]
+    depends_on:
+      solver:
+        condition: service_healthy
+    environment:
+      TURNSTILE_SOLVER_URL: http://solver:5072
+    volumes:
+      - ./.env:/app/.env
+      - ./keys:/app/keys
+    ports:
+      - "15080:5080"
+    restart: unless-stopped
