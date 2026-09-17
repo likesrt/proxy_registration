@@ -45,6 +45,9 @@ from src.proxyscrape_helpers import (  # noqa: E402
     remove_account_details_cache,
     clear_account_details_cache,
     is_access_token_expired,
+    account_expiry_state,
+    resolve_cached_account_id,
+    collect_valid_proxy_lines,
 )
 from src.env_config import (  # noqa: E402
     DEFAULT_ENV_PATH,
@@ -83,6 +86,14 @@ def _web_password() -> str:
     return (os.getenv("WEB_PASSWORD") or DEFAULT_WEB_PASSWORD).strip() or DEFAULT_WEB_PASSWORD
 
 
+def _feed_token() -> str:
+    """Current proxy-feed token from env (read per request so /config applies at once).
+
+    Empty means the feed is disabled — never serve an unauthenticated feed.
+    """
+    return (os.getenv("FEED_TOKEN") or "").strip()
+
+
 def _is_authed() -> bool:
     return bool(session.get("web_auth"))
 
@@ -105,6 +116,8 @@ _AUTH_PUBLIC_PATHS = frozenset(
         "/api/auth/login",
         "/api/auth/status",
         "/api/health",
+        # Token-gated inside the route (remote feed pullers cannot log in)
+        "/api/feed/proxies",
     }
 )
 
@@ -376,6 +389,148 @@ def _run_register_job(count: int):
 
 
 # ---------------------------------------------------------------------------
+# Auto top-up registration scheduler
+#
+# Single-process only: this is a daemon thread inside web_app.py, and it assumes
+# one process owns keys/. Do not run web_app.py under multiple workers.
+# ---------------------------------------------------------------------------
+
+_AUTO_REGISTER_MAX_BACKOFF = 6
+_AUTO_REGISTER_DISABLED_POLL = 60.0
+
+_scheduler_stop = threading.Event()
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float((os.getenv(name) or "").strip() or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _auto_register_config() -> dict:
+    """Read scheduler config from env on every tick (config page changes apply live)."""
+    enabled = (os.getenv("AUTO_REGISTER_ENABLED", "false") or "false").strip().lower()
+    return {
+        "enabled": enabled in ("1", "true", "yes", "on"),
+        "interval": max(30, _env_int("AUTO_REGISTER_INTERVAL", 1800)),
+        "target": max(1, _env_int("AUTO_REGISTER_TARGET", 50)),
+        "min_valid": max(0, _env_int("AUTO_REGISTER_MIN_VALID", 10)),
+        "max_per_round": max(1, _env_int("AUTO_REGISTER_MAX_PER_ROUND", 20)),
+    }
+
+
+def _count_feed_eligible() -> Optional[int]:
+    """Usable accounts (usable expiry + non-empty proxy file), or None on error."""
+    try:
+        return int(collect_valid_proxy_lines().get("feed_eligible_count") or 0)
+    except Exception as e:
+        _append_log(f"[-] [auto] 统计可供给账号失败: {str(e)[:160]}")
+        return None
+
+
+def _maybe_auto_register_once() -> dict:
+    """One scheduler decision. Returns {action, have?, needed?}."""
+    cfg = _auto_register_config()
+    if not cfg["enabled"]:
+        return {"action": "disabled"}
+
+    have = _count_feed_eligible()
+    if have is None:
+        return {"action": "error"}
+    if have >= cfg["min_valid"]:
+        return {"action": "enough", "have": have}
+
+    # "How many can I serve" is the metric, not reg.success_count (which only
+    # counts API successes, regardless of whether a usable account resulted).
+    needed = max(1, min(cfg["target"] - have, cfg["max_per_round"]))
+
+    # Same critical section as POST /api/register — never run two rounds at once.
+    with _register_lock:
+        if _register_job["running"]:
+            return {"action": "busy", "have": have}
+        _register_job["running"] = True
+        _register_job["requested"] = needed
+        _register_job["started_at"] = time.time()
+        _register_job["finished_at"] = None
+        _register_job["message"] = f"auto starting count={needed}"
+
+    _append_log(
+        f"[*] [auto] 可供给账号 {have} < {cfg['min_valid']}，自动补齐 {needed} 个"
+    )
+    threading.Thread(target=_run_register_job, args=(needed,), daemon=True).start()
+    return {"action": "started", "have": have, "needed": needed}
+
+
+def _wait_for_register_job(timeout: float = 6 * 3600.0, poll: float = 2.0) -> None:
+    """Wait until the running register round finishes (or stop/timeout)."""
+    deadline = time.time() + timeout
+    while _register_job.get("running"):
+        if _scheduler_stop.is_set() or time.time() >= deadline:
+            return
+        if _scheduler_stop.wait(poll):
+            return
+
+
+def _auto_register_loop() -> None:
+    backoff = 1
+    while not _scheduler_stop.is_set():
+        interval = _auto_register_config()["interval"]
+        wait = float(interval)
+        try:
+            result = _maybe_auto_register_once()
+        except Exception as e:
+            _append_log(f"[-] [auto] 调度异常: {str(e)[:160]}")
+            result = {"action": "error"}
+
+        action = result.get("action")
+        if action == "disabled":
+            # Cheap no-op tick so flipping AUTO_REGISTER_ENABLED takes effect soon.
+            wait = min(float(interval), _AUTO_REGISTER_DISABLED_POLL)
+        elif action == "started":
+            # Backoff: register_accounts() returns immediately when the Turnstile
+            # solver is unavailable, so a round that does not raise the usable
+            # account count must slow down instead of spinning every interval.
+            before = result.get("have")
+            _wait_for_register_job()
+            after = _count_feed_eligible()
+            if before is not None and after is not None and after > before:
+                backoff = 1
+            else:
+                backoff = min(backoff * 2, _AUTO_REGISTER_MAX_BACKOFF)
+                _append_log(
+                    f"[!] [auto] 本轮未增加可供给账号 ({before} → {after})，"
+                    f"下轮等待 ×{backoff}"
+                )
+            wait = float(interval) * backoff
+
+        if _scheduler_stop.wait(wait):
+            return
+
+
+def _start_auto_register_scheduler() -> bool:
+    """Start the daemon scheduler once (idempotent). Called from main() only."""
+    global _scheduler_started
+    with _scheduler_lock:
+        if _scheduler_started:
+            return False
+        _scheduler_started = True
+    _scheduler_stop.clear()
+    threading.Thread(
+        target=_auto_register_loop, name="auto-register", daemon=True
+    ).start()
+    cfg = _auto_register_config()
+    _append_log(
+        f"[*] [auto] 调度器已启动 enabled={cfg['enabled']} "
+        f"interval={cfg['interval']}s min_valid={cfg['min_valid']} "
+        f"target={cfg['target']}"
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # HTML UI
 # ---------------------------------------------------------------------------
 
@@ -472,7 +627,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button type="button" class="secondary" id="btnReload">刷新列表</button>
       <button type="button" id="btnRefreshAll">刷新全部详情</button>
       <button type="button" id="btnDownloadAll">下载全部 proxies</button>
-      <button type="button" id="btnUploadResin">上传全部到 Resin</button>
+      <button type="button" class="danger" id="btnDeleteInvalid">删除过期账号</button>
       <button type="button" class="danger" id="btnDeleteAll">全部删除</button>
       <button type="button" class="secondary" id="btnLogout">退出</button>
     </div>
@@ -765,43 +920,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    async function uploadAllToResin() {
-      if (!confirm("确定上传全部 proxies 到 Resin？")) return;
-      const useLive = confirm(
-        "是否先在线汇总各账号代理？\n\n" +
-        "确定 = 在线汇总后上传（推荐）\n" +
-        "取消 = 仅上传本地 keys/proxies.txt"
-      );
-      const btn = $("btnUploadResin");
-      btn.disabled = true;
-      appendLogLines([`[*] 开始上传到 Resin（${useLive ? "在线汇总" : "本地 proxies.txt"}）...`]);
-      try {
-        const data = await api("/api/proxies/upload-resin", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ live: useLive }),
-        });
-        if (data.skipped) {
-          alert(data.message || "已跳过（未配置 Resin）");
-          appendLogLines([`[*] ${data.message || "跳过上传"}`]);
-        } else if (data.ok) {
-          alert(`上传成功：${data.line_count || 0} 行`);
-          appendLogLines([
-            `[✓] Resin 上传成功 ${data.line_count || 0} 行` +
-            (data.source ? ` · 来源 ${data.source}` : "") +
-            (data.message ? ` · ${data.message}` : "")
-          ]);
-        } else {
-          throw new Error(data.message || data.error || "上传失败");
-        }
-      } catch (e) {
-        alert(e.message);
-        appendLogLines([`[-] Resin 上传失败: ${e.message}`]);
-      } finally {
-        btn.disabled = false;
-      }
-    }
-
     function mergePreservedDetails(freshList) {
       // Keep previously refreshed overview details when reloading without live=1
       const prev = {};
@@ -879,6 +997,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
       } catch (e) { alert(e.message); }
     }
 
+    async function deleteInvalidAccounts() {
+      if (!confirm(
+        "删除已过期账号及其本地数据？\n\n" +
+        "默认只删除已过期（expired）账号，到期时间未知的账号会保留。\n" +
+        "此操作不可恢复（仅本地文件）。"
+      )) return;
+      const includeUnknown = confirm(
+        "是否同时删除「到期时间未知」的账号？\n\n" +
+        "确定 = 一并删除（这些账号无法确认是否仍然有效）\n" +
+        "取消 = 只删已过期账号"
+      );
+      const btn = $("btnDeleteInvalid");
+      btn.disabled = true;
+      try {
+        const data = await api("/api/accounts/delete-invalid", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ include_unknown: includeUnknown }),
+        });
+        const gone = data.deleted || [];
+        if (gone.length) {
+          const goneSet = new Set(gone.map(e => (e || "").toLowerCase()));
+          accountsCache = accountsCache.filter(
+            a => !goneSet.has((a.email || "").toLowerCase())
+          );
+          renderTable(accountsCache);
+          tickCountdowns();
+        }
+        appendLogLines([
+          `[✓] 删除失效账号 ${gone.length} 个` +
+          `（含 unknown: ${data.include_unknown ? "是" : "否"}）· ` +
+          `账号行 ${data.removed?.account_lines || 0} · ` +
+          `代理文件 ${data.removed?.proxy_files || 0} · ` +
+          `proxies.txt ${data.removed?.proxy_lines || 0} 行`
+        ]);
+      } catch (e) { alert(e.message); }
+      finally { btn.disabled = false; }
+    }
+
     async function loadList(live) {
       const q = live ? "?live=1" : "";
       const data = await api("/api/accounts" + q);
@@ -896,8 +1053,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       $("btnRefreshAll").disabled = false;
     };
     $("btnDeleteAll").onclick = () => deleteAllAccounts();
+    $("btnDeleteInvalid").onclick = () => deleteInvalidAccounts();
     $("btnDownloadAll").onclick = () => downloadAllProxies();
-    $("btnUploadResin").onclick = () => uploadAllToResin();
     $("btnLogout").onclick = async () => {
       try {
         await api("/api/auth/logout", { method: "POST" });
@@ -1470,6 +1627,70 @@ async def api_accounts_delete_all():
     return jsonify(result)
 
 
+@app.post("/api/accounts/delete-invalid")
+async def api_accounts_delete_invalid():
+    """
+    Delete accounts whose cached expiry says they are dead (manual action only —
+    the feed never deletes anything).
+
+    body: { "include_unknown": false }
+      default: only state == "expired"
+      include_unknown: also drop accounts with no usable expiry (kept by default,
+      because "unknown" is treated as valid by the feed).
+    """
+    body = await request.get_json(force=True, silent=True) or {}
+    include_unknown = body.get("include_unknown", False)
+    if isinstance(include_unknown, str):
+        include_unknown = include_unknown.lower() not in ("0", "false", "no")
+
+    wanted = {"expired"}
+    if include_unknown:
+        wanted.add("unknown")
+
+    accounts = load_accounts_from_file()
+    cache = load_account_details_cache()
+    deleted: list = []
+    removed = {"account_lines": 0, "proxy_files": 0, "proxy_lines": 0}
+
+    for acc in accounts:
+        email = (acc.get("email") or "").strip()
+        if not email:
+            continue
+        entry = cache.get(email.lower())
+        if account_expiry_state(entry) not in wanted:
+            continue
+        details = entry.get("details") if isinstance(entry, dict) else {}
+        details = details if isinstance(details, dict) else {}
+        result = delete_account_local_data(
+            email,
+            account_id=resolve_cached_account_id(entry),
+            proxy_username=details.get("proxy_username") or "",
+        )
+        if not result.get("ok"):
+            continue
+        remove_account_details_cache(email)
+        deleted.append(email)
+        rm = result.get("removed") or {}
+        removed["account_lines"] += rm.get("account_lines") or 0
+        removed["proxy_files"] += len(rm.get("proxy_files") or [])
+        removed["proxy_lines"] += rm.get("proxy_lines") or 0
+
+    if deleted:
+        _append_log(
+            f"[✓] 删除失效账号 {len(deleted)} 个 "
+            f"(include_unknown={bool(include_unknown)})"
+        )
+    return jsonify(
+        {
+            "ok": True,
+            "deleted": deleted,
+            "count": len(deleted),
+            "include_unknown": bool(include_unknown),
+            "removed": removed,
+        }
+    )
+
+
 @app.post("/api/register")
 async def api_register():
     body = await request.get_json(force=True, silent=True) or {}
@@ -1641,58 +1862,72 @@ async def api_download_all_proxies():
     )
 
 
-@app.post("/api/proxies/upload-resin")
-async def api_upload_proxies_resin():
+@app.get("/api/feed/proxies")
+async def api_feed_proxies():
     """
-    Upload all proxies to Resin subscription (PATCH).
-    body: { "live": true|false }
-      live=true  — re-download each account then upload
-      live=false — upload keys/proxies.txt only
+    Read-only proxy feed for remote pullers (e.g. a subscription client).
+
+    Auth: FEED_TOKEN via `X-Feed-Token` header or `?token=` query param.
+      - token unset  -> 503 (feed disabled; never serve an open feed)
+      - token wrong  -> 401
+    Data: local per-account files only (collect_valid_proxy_lines). No network
+    calls, no re-login, no side effects. Empty result is 200 + empty body.
     """
-    body = await request.get_json(force=True, silent=True) or {}
-    live = body.get("live", True)
-    if isinstance(live, str):
-        live = live.lower() not in ("0", "false", "no")
-
-    collected = _collect_all_proxy_lines(live=bool(live))
-    lines = collected["lines"]
-    if not lines:
-        msg = "无可用代理可上传"
-        if collected["errors"]:
-            msg += ": " + "; ".join(collected["errors"][:5])
-        return jsonify(
-            {
-                "ok": False,
-                "error": msg,
-                "errors": collected["errors"],
-            }
-        ), 400
-
-    content = "\n".join(lines) + "\n"
-    # Keep local file in sync when live-collected
-    if collected["source"] == "live":
-        try:
-            os.makedirs(os.path.dirname(PROXIES_FILE) or "keys", exist_ok=True)
-            with open(PROXIES_FILE, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError as e:
-            _append_log(f"[!] 写入本地 proxies.txt 失败: {e}")
-
-    result = reg.upload_proxies_to_resin(content=content)
-    result["source"] = collected["source"]
-    result["errors"] = collected["errors"]
-    if result.get("ok"):
-        _append_log(
-            f"[✓] Resin 上传成功 {result.get('line_count')} 行 "
-            f"(source={collected['source']})"
+    expected = _feed_token()
+    if not expected:
+        return Response(
+            "feed 未开启\n",
+            status=503,
+            mimetype="text/plain",
+            headers={"Cache-Control": "no-store"},
         )
-    elif result.get("skipped"):
-        _append_log(f"[*] Resin 跳过: {result.get('message')}")
-    else:
-        _append_log(f"[-] Resin 上传失败: {result.get('message')}")
 
-    status = 200 if result.get("ok") or result.get("skipped") else 400
-    return jsonify(result), status
+    provided = (request.headers.get("X-Feed-Token") or "").strip()
+    if not provided:
+        provided = (request.args.get("token") or "").strip()
+    try:
+        token_ok = hmac.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        token_ok = False
+    if not token_ok:
+        return Response(
+            "unauthorized\n",
+            status=401,
+            mimetype="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        snap = collect_valid_proxy_lines()
+    except Exception as e:
+        _append_log(f"[-] feed 收集失败: {str(e)[:160]}")
+        return Response(
+            f"feed error: {str(e)[:160]}\n",
+            status=500,
+            mimetype="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    lines = snap["lines"]
+    errors = [
+        f"{row['email']}: {row['reason']}"
+        for row in snap["accounts"]
+        if row.get("reason") and row.get("reason") != "expired"
+    ]
+    body = "\n".join(lines) + ("\n" if lines else "")
+    return Response(
+        body,
+        status=200,
+        mimetype="text/plain",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Proxy-Count": str(len(lines)),
+            "X-Proxy-Accounts": str(snap["feed_eligible_count"]),
+            "X-Proxy-Errors": "; ".join(errors)[:500] if errors else "",
+        },
+    )
 
 
 def main():
@@ -1702,7 +1937,17 @@ def main():
     print(f"打开: http://{HOST}:{PORT}/")
     print(f"登录: /login  （WEB_PASSWORD={'(默认 admin)' if pwd == DEFAULT_WEB_PASSWORD else '已配置'}）")
     print(f"账号文件: {ACCOUNTS_FILE}")
-    print("API: /api/accounts  /api/register  /api/register/logs  /api/proxies/download-all")
+    print(
+        "API: /api/accounts  /api/register  /api/register/logs  "
+        "/api/proxies/download-all  /api/feed/proxies"
+    )
+    cfg = _auto_register_config()
+    print(
+        f"[*] 自动补齐: enabled={cfg['enabled']} interval={cfg['interval']}s "
+        f"min_valid={cfg['min_valid']} target={cfg['target']} "
+        f"max_per_round={cfg['max_per_round']}"
+    )
+    _start_auto_register_scheduler()
     print("=" * 60)
     app.run(host=HOST, port=PORT, debug=False)
 

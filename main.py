@@ -35,14 +35,11 @@ from src.proxyscrape_helpers import (
     TURNSTILE_SITEKEY,
     DEFAULT_PROXY_PROTOCOL,
     CREDENTIAL_FORMAT_PROTOCOL_URL,
-    PROXIES_FILE,
     generate_register_password,
     password_meets_rules,
     parse_verification_code,
     save_account_credentials,
     save_proxy_lines,
-    load_proxies_file_content,
-    build_resin_subscription_payload,
     build_register_form_fields,
     build_login_form_fields,
     build_typeform_complete_fields,
@@ -58,6 +55,8 @@ from src.proxyscrape_helpers import (
     is_protocol_url_proxy_line,
     is_access_token_expired,
     update_account_access_token,
+    normalize_overview_payload,
+    upsert_account_details_cache,
 )
 
 REGISTER_PASSWORD = os.getenv("REGISTER_PASSWORD", "random").strip()
@@ -71,33 +70,6 @@ DEFAULT_IMPERSONATE = "chrome120"
 PROXY_DOWNLOAD_PROTOCOL = (
     os.getenv("PROXY_DOWNLOAD_PROTOCOL", DEFAULT_PROXY_PROTOCOL) or "http"
 ).strip().lower()
-
-# Remote Resin subscription: PATCH proxies.txt after full batch success
-# Example:
-#   RESIN_SUBSCRIPTION_URL=https://resin.example.com/api/v1/subscriptions/<uuid>
-#   RESIN_API_TOKEN=...
-RESIN_SUBSCRIPTION_URL = os.getenv("RESIN_SUBSCRIPTION_URL", "").strip()
-RESIN_API_TOKEN = os.getenv("RESIN_API_TOKEN", "").strip()
-RESIN_NAME = os.getenv("RESIN_NAME", "proxyscrape").strip() or "proxyscrape"
-RESIN_UPDATE_INTERVAL = os.getenv("RESIN_UPDATE_INTERVAL", "12h").strip() or "12h"
-RESIN_EPHEMERAL_NODE_EVICT_DELAY = (
-    os.getenv("RESIN_EPHEMERAL_NODE_EVICT_DELAY", "72h0m0s").strip() or "72h0m0s"
-)
-RESIN_ENABLED = os.getenv("RESIN_ENABLED", "true").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-)
-RESIN_EPHEMERAL = os.getenv("RESIN_EPHEMERAL", "false").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-RESIN_INCREMENTAL_ALIVE_NODES = os.getenv(
-    "RESIN_INCREMENTAL_ALIVE_NODES", "false"
-).strip().lower() in ("1", "true", "yes", "on")
 
 PROXIES = (
     {
@@ -1003,6 +975,25 @@ def register_accounts():
                         f"{(pp[:3] + '***') if pp else None} "
                         f"proxy_amount={n_proxies}"
                     )
+                    # Cache expiry/bandwidth now: the feed reads this later, and
+                    # re-using the overview we already fetched costs no extra request.
+                    # overview failure writes nothing → account stays 'unknown'.
+                    try:
+                        details = normalize_overview_payload(ov)
+                        if details.get("ok"):
+                            upsert_account_details_cache(
+                                {
+                                    "email": email,
+                                    "details": details,
+                                    # /me-derived id — same value used for the filename
+                                    "subaccount_id": account_id,
+                                    "email_verified": True,
+                                    "typeform_pending": False,
+                                    "flags": [],
+                                }
+                            )
+                    except Exception as e:
+                        print(f"[-] {email} 详情缓存写入失败: {e}")
 
                 dres = download_premium_proxies(
                     session, access_token, account_id, PROXY_DOWNLOAD_PROTOCOL
@@ -1077,94 +1068,6 @@ def _read_target_count() -> int:
         return 100
 
 
-def upload_proxies_to_resin(
-    proxies_file: str | None = None,
-    subscription_url: str | None = None,
-    api_token: str | None = None,
-    content: str | None = None,
-) -> dict:
-    """
-    PATCH all proxies to remote Resin subscription.
-
-    content: if provided, upload this text directly; else read keys/proxies.txt
-    (or proxies_file).
-
-    curl equivalent:
-      PATCH {RESIN_SUBSCRIPTION_URL}
-      Authorization: Bearer {RESIN_API_TOKEN}
-      Content-Type: application/json
-      body: { name, update_interval, ..., content: "<proxy lines>" }
-    """
-    url = (subscription_url if subscription_url is not None else RESIN_SUBSCRIPTION_URL).strip()
-    token = (api_token if api_token is not None else RESIN_API_TOKEN).strip()
-    path = proxies_file or PROXIES_FILE
-
-    if not url or not token:
-        return {
-            "ok": False,
-            "skipped": True,
-            "message": "未配置 RESIN_SUBSCRIPTION_URL / RESIN_API_TOKEN，跳过远程上传",
-        }
-
-    if content is None:
-        content = load_proxies_file_content(path)
-    elif not str(content).endswith("\n") and str(content).strip():
-        content = str(content).rstrip() + "\n"
-
-    if not (content or "").strip():
-        return {
-            "ok": False,
-            "skipped": False,
-            "message": f"代理内容为空（文件: {path}）",
-        }
-
-    line_count = len([ln for ln in content.splitlines() if ln.strip()])
-    payload = build_resin_subscription_payload(
-        content=content,
-        name=RESIN_NAME,
-        update_interval=RESIN_UPDATE_INTERVAL,
-        ephemeral_node_evict_delay=RESIN_EPHEMERAL_NODE_EVICT_DELAY,
-        enabled=RESIN_ENABLED,
-        ephemeral=RESIN_EPHEMERAL,
-        incremental_alive_nodes=RESIN_INCREMENTAL_ALIVE_NODES,
-    )
-
-    print(f"[*] 上传 proxies 到远程订阅 ({line_count} 行)...")
-    print(f"[*] PATCH {url}")
-    try:
-        import requests as std_requests
-
-        res = std_requests.patch(
-            url,
-            json=payload,
-            headers={
-                "accept": "*/*",
-                "authorization": f"Bearer {token}",
-                "content-type": "application/json; charset=utf-8",
-                "origin": url.split("/api/")[0] if "/api/" in url else url,
-                "user-agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/150.0.0.0 Safari/537.36"
-                ),
-            },
-            timeout=60,
-        )
-    except Exception as e:
-        return {"ok": False, "skipped": False, "message": str(e), "status": 0}
-
-    ok = 200 <= res.status_code < 300
-    body_preview = (res.text or "")[:300]
-    return {
-        "ok": ok,
-        "skipped": False,
-        "status": res.status_code,
-        "message": body_preview if not ok else f"HTTP {res.status_code} 上传成功",
-        "line_count": line_count,
-        "url": url,
-    }
-
-
 def main():
     print("=" * 60)
     print("ProxyScrape 注册 + Premium 代理下载")
@@ -1177,10 +1080,6 @@ def main():
     print(f"[+] Register: {REGISTER_ENDPOINT}")
     print(f"[+] Turnstile sitekey: {TURNSTILE_SITEKEY}")
     print(f"[+] Proxy download credential_format={CREDENTIAL_FORMAT_PROTOCOL_URL}")
-    if RESIN_SUBSCRIPTION_URL and RESIN_API_TOKEN:
-        print(f"[+] 批量完成后上传: {RESIN_SUBSCRIPTION_URL}")
-    else:
-        print("[!] 未配置 RESIN_SUBSCRIPTION_URL/RESIN_API_TOKEN — 完成后不上传远程")
 
     global target_count, stop_flag, success_count, start_time
     target_count = _read_target_count()
@@ -1204,28 +1103,7 @@ def main():
         print("\n[!] 检测到 Ctrl+C，已停止")
 
     print(f"[*] 结束，成功注册 {success_count}/{target_count}")
-
-    # Only push remote when the full requested batch succeeded
-    if success_count >= target_count and success_count > 0:
-        print(f"[*] 目标数量已全部完成，开始上传 keys/proxies.txt ...")
-        result = upload_proxies_to_resin()
-        if result.get("skipped"):
-            print(f"[*] {result['message']}")
-        elif result.get("ok"):
-            print(
-                f"[✓] 远程上传成功: {result.get('line_count')} 行 | "
-                f"{result.get('message')}"
-            )
-        else:
-            print(
-                f"[-] 远程上传失败"
-                + (f" ({result.get('status')})" if result.get("status") else "")
-                + f": {result.get('message')}"
-            )
-    elif success_count > 0:
-        print(
-            f"[*] 未达目标 ({success_count}/{target_count})，跳过远程上传"
-        )
+    print("[*] 代理列表由 Resin 反向拉取本机 feed: GET /api/feed/proxies")
 
 
 if __name__ == "__main__":

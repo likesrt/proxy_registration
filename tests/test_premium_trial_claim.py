@@ -81,7 +81,7 @@ class TestPremiumTrialRegistrationOrder(unittest.TestCase):
 
         step_four = source.index("# Step 4: Typeform onboarding")
         confirmation = source.index(
-            "if not is_typeform_onboarding_complete(me4):", step_four
+            "if me4 is not None and needs_typeform_onboarding(me4):", step_four
         )
         claim = source.index("cres = claim_premium_trial(session, access_token)", step_four)
         self.assertLess(confirmation, claim)

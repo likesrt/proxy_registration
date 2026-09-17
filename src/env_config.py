@@ -68,6 +68,13 @@ CONFIG_SCHEMA = [
                 "type": "password",
                 "default": "",
                 "secret": True,
+                "help": "留空时自动从公开 key 接口获取（进程内缓存 1 小时，不写回 .env）",
+            },
+            {
+                "key": "GPTMAIL_PUBLIC_KEY_URL",
+                "label": "公开 Key 接口",
+                "type": "text",
+                "default": "https://mail.chatgpt.org.uk/api/public-key-status?reveal=1",
             },
         ],
     },
@@ -132,59 +139,56 @@ CONFIG_SCHEMA = [
         ],
     },
     {
-        "group": "Resin 上传",
+        "group": "代理 Feed",
         "keys": [
             {
-                "key": "RESIN_SUBSCRIPTION_URL",
-                "label": "订阅 URL",
-                "type": "text",
-                "default": "",
-            },
-            {
-                "key": "RESIN_API_TOKEN",
-                "label": "API Token",
+                "key": "FEED_TOKEN",
+                "label": "Feed Token",
                 "type": "password",
                 "default": "",
                 "secret": True,
+                "help": (
+                    "留空 = 关闭 feed（GET /api/feed/proxies 返回 503，不会开放匿名访问）；"
+                    "拉取方需带 ?token=xxx 或 X-Feed-Token: xxx"
+                ),
             },
+        ],
+    },
+    {
+        "group": "自动注册",
+        "keys": [
             {
-                "key": "RESIN_NAME",
-                "label": "订阅名称",
-                "type": "text",
-                "default": "proxyscrape",
-            },
-            {
-                "key": "RESIN_UPDATE_INTERVAL",
-                "label": "更新间隔",
-                "type": "text",
-                "default": "12h",
-            },
-            {
-                "key": "RESIN_EPHEMERAL_NODE_EVICT_DELAY",
-                "label": "节点驱逐延迟",
-                "type": "text",
-                "default": "72h0m0s",
-            },
-            {
-                "key": "RESIN_ENABLED",
-                "label": "Enabled",
-                "type": "select",
-                "options": ["true", "false"],
-                "default": "true",
-            },
-            {
-                "key": "RESIN_EPHEMERAL",
-                "label": "Ephemeral",
+                "key": "AUTO_REGISTER_ENABLED",
+                "label": "启用自动补齐",
                 "type": "select",
                 "options": ["true", "false"],
                 "default": "false",
+                "help": "按「可供给账号数」自动补齐注册（仅 web_app.py 单进程内调度）",
             },
             {
-                "key": "RESIN_INCREMENTAL_ALIVE_NODES",
-                "label": "Incremental alive nodes",
-                "type": "select",
-                "options": ["true", "false"],
-                "default": "false",
+                "key": "AUTO_REGISTER_INTERVAL",
+                "label": "检查间隔(秒)",
+                "type": "number",
+                "default": "1800",
+            },
+            {
+                "key": "AUTO_REGISTER_TARGET",
+                "label": "目标可供给账号数",
+                "type": "number",
+                "default": "50",
+            },
+            {
+                "key": "AUTO_REGISTER_MIN_VALID",
+                "label": "低于该值才补齐",
+                "type": "number",
+                "default": "10",
+                "help": "可供给账号数 >= 该值时不做任何事",
+            },
+            {
+                "key": "AUTO_REGISTER_MAX_PER_ROUND",
+                "label": "每轮最多注册",
+                "type": "number",
+                "default": "20",
             },
         ],
     },
@@ -415,35 +419,6 @@ def reload_main_module_config(main_mod) -> list:
     setg(
         "PROXY_DOWNLOAD_PROTOCOL",
         (os.getenv("PROXY_DOWNLOAD_PROTOCOL", "http") or "http").strip().lower(),
-    )
-    setg("RESIN_SUBSCRIPTION_URL", os.getenv("RESIN_SUBSCRIPTION_URL", "").strip())
-    setg("RESIN_API_TOKEN", os.getenv("RESIN_API_TOKEN", "").strip())
-    setg(
-        "RESIN_NAME",
-        os.getenv("RESIN_NAME", "proxyscrape").strip() or "proxyscrape",
-    )
-    setg(
-        "RESIN_UPDATE_INTERVAL",
-        os.getenv("RESIN_UPDATE_INTERVAL", "12h").strip() or "12h",
-    )
-    setg(
-        "RESIN_EPHEMERAL_NODE_EVICT_DELAY",
-        os.getenv("RESIN_EPHEMERAL_NODE_EVICT_DELAY", "72h0m0s").strip() or "72h0m0s",
-    )
-    setg(
-        "RESIN_ENABLED",
-        os.getenv("RESIN_ENABLED", "true").strip().lower()
-        not in ("0", "false", "no", "off"),
-    )
-    setg(
-        "RESIN_EPHEMERAL",
-        os.getenv("RESIN_EPHEMERAL", "false").strip().lower()
-        in ("1", "true", "yes", "on"),
-    )
-    setg(
-        "RESIN_INCREMENTAL_ALIVE_NODES",
-        os.getenv("RESIN_INCREMENTAL_ALIVE_NODES", "false").strip().lower()
-        in ("1", "true", "yes", "on"),
     )
     proxy = os.getenv("PROXY")
     setg(

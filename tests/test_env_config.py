@@ -47,29 +47,65 @@ class TestEnvConfig(unittest.TestCase):
         for k in (
             "EMAIL_SERVICE_TYPE",
             "TURNSTILE_SOLVER_URL",
-            "RESIN_SUBSCRIPTION_URL",
-            "RESIN_API_TOKEN",
             "REGISTER_PASSWORD",
             "WEB_PORT",
             "WEB_PASSWORD",
+            "FEED_TOKEN",
+            "AUTO_REGISTER_ENABLED",
+            "AUTO_REGISTER_INTERVAL",
+            "AUTO_REGISTER_TARGET",
+            "AUTO_REGISTER_MIN_VALID",
+            "AUTO_REGISTER_MAX_PER_ROUND",
+            "GPTMAIL_PUBLIC_KEY_URL",
         ):
             self.assertIn(k, keys)
+        # Removed with the Resin push chain
+        self.assertNotIn("RESIN_SUBSCRIPTION_URL", keys)
+        self.assertNotIn("RESIN_API_TOKEN", keys)
 
     def test_get_config_for_ui(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, ".env")
             with open(path, "w", encoding="utf-8") as f:
-                f.write("RESIN_NAME=MyName\nADMIN_PASSWORD=secret\n")
+                f.write("WEB_PASSWORD=MyName\nADMIN_PASSWORD=secret\n")
             # Isolate this temporary file from values loaded from the project's .env.
             with patch.dict(os.environ, {}, clear=True):
                 data = get_config_for_ui(path, include_secrets=True)
                 self.assertTrue(data["exists"])
-                self.assertEqual(data["values"].get("RESIN_NAME"), "MyName")
+                self.assertEqual(data["values"].get("WEB_PASSWORD"), "MyName")
                 self.assertEqual(data["values"].get("ADMIN_PASSWORD"), "secret")
                 self.assertTrue(data["secrets_set"].get("ADMIN_PASSWORD"))
                 masked = get_config_for_ui(path, include_secrets=False)
                 self.assertEqual(masked["values"].get("ADMIN_PASSWORD"), "")
                 self.assertTrue(masked["secrets_set"].get("ADMIN_PASSWORD"))
+
+    def test_feed_token_defaults_disabled(self):
+        """Empty FEED_TOKEN is the safe default (route answers 503, never open)."""
+        from src.env_config import CONFIG_SCHEMA
+
+        item = next(
+            i
+            for g in CONFIG_SCHEMA
+            for i in g["keys"]
+            if i["key"] == "FEED_TOKEN"
+        )
+        self.assertEqual(item.get("default"), "")
+        self.assertTrue(item.get("secret") or item.get("type") == "password")
+
+    def test_auto_register_defaults(self):
+        from src.env_config import CONFIG_SCHEMA
+
+        vals = {
+            i["key"]: i.get("default")
+            for g in CONFIG_SCHEMA
+            for i in g["keys"]
+            if i["key"].startswith("AUTO_REGISTER_")
+        }
+        self.assertEqual(vals["AUTO_REGISTER_ENABLED"], "false")
+        self.assertEqual(vals["AUTO_REGISTER_INTERVAL"], "1800")
+        self.assertEqual(vals["AUTO_REGISTER_TARGET"], "50")
+        self.assertEqual(vals["AUTO_REGISTER_MIN_VALID"], "10")
+        self.assertEqual(vals["AUTO_REGISTER_MAX_PER_ROUND"], "20")
 
     def test_secret_true_without_password_type_in_schema(self):
         """Fields with only secret:True (type text) must still be treated as secrets."""

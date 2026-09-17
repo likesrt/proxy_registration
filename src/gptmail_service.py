@@ -6,8 +6,76 @@
 import os
 import random
 import string
+import threading
+import time
+from typing import Optional
+
 import requests
 from dotenv import load_dotenv
+
+# 公开 key 接口：站点前端用「点击显示」按钮调用它拿到可用的 X-API-Key
+DEFAULT_PUBLIC_KEY_URL = "https://mail.chatgpt.org.uk/api/public-key-status?reveal=1"
+_PUBLIC_KEY_TTL = 3600
+_public_key_lock = threading.Lock()
+_public_key_cache: dict = {"key": None, "fetched_at": 0.0}
+
+
+def fetch_public_api_key(
+    url: Optional[str] = None,
+    timeout: int = 10,
+) -> Optional[str]:
+    """GET 公开 key 接口并解析 data.key。任何失败都返回 None，绝不抛异常。"""
+    target = (
+        url
+        or os.getenv("GPTMAIL_PUBLIC_KEY_URL")
+        or DEFAULT_PUBLIC_KEY_URL
+    )
+    target = str(target).strip()
+    if not target:
+        return None
+    try:
+        res = requests.get(
+            target,
+            headers={
+                "X-Public-Key-Reveal": "click",
+                "Referer": "https://mail.chatgpt.org.uk/zh/api/",
+                "Accept": "*/*",
+            },
+            timeout=timeout,
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    key = payload.get("key")
+    if not key or not str(key).strip():
+        return None
+    return str(key).strip()
+
+
+def get_public_api_key(force: bool = False) -> Optional[str]:
+    """
+    进程内缓存的公开 API key（TTL 1 小时），不回写 .env。
+
+    成功才更新缓存；失败时回退到上一次已知的 key（可能为 None）。
+    """
+    now = time.time()
+    with _public_key_lock:
+        cached = _public_key_cache.get("key")
+        fetched_at = float(_public_key_cache.get("fetched_at") or 0.0)
+        if not force and cached and (now - fetched_at) < _PUBLIC_KEY_TTL:
+            return cached
+
+    key = fetch_public_api_key()
+    with _public_key_lock:
+        if key:
+            _public_key_cache["key"] = key
+            _public_key_cache["fetched_at"] = time.time()
+        return _public_key_cache.get("key")
 
 
 class GPTMailService:
@@ -31,7 +99,13 @@ class GPTMailService:
             for d in raw_domains.replace(";", ",").replace(" ", ",").split(",")
             if d.strip()
         ]
-        self.api_key = os.getenv("GPTMAIL_API_KEY", "gpt-test")
+        # 优先 .env 的 GPTMAIL_API_KEY；留空则用公开 key 接口（进程内缓存）；
+        # 都失败时沿用旧的 gpt-test 默认值，不中断注册。
+        self.api_key = (
+            (os.getenv("GPTMAIL_API_KEY") or "").strip()
+            or get_public_api_key()
+            or "gpt-test"
+        )
         self.timeout = timeout
 
     def _next_domain(self) -> str:

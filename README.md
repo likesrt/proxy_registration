@@ -1,6 +1,6 @@
 # ProxyScrape 自动注册 + Premium 代理下载
 
-自动完成 ProxyScrape 账号注册，下载试用 Premium 代理列表，并在批量全部成功后把 `proxies.txt` 上传到远程订阅（Resin）。
+自动完成 ProxyScrape 账号注册，下载试用 Premium 代理列表。本机**不再主动推送**代理到远程订阅，而是由远程订阅（Resin）**反向拉取**本机的只读 feed 接口 `GET /api/feed/proxies`；同时支持按「可供给账号数」自动补齐注册。
 
 **主产物格式：**
 
@@ -25,10 +25,12 @@ http://s04xvtwkxqsv:3f0gsnlwbbsonwm@209.50.163.168:3129
 | 3. 问卷 | 完成 `/v2/typeform` 引导（API 提交，无需手动点页面） |
 | 4. 激活试用 | 确认 `/me` 的 `typeform=false` 后，`POST /v2/v4/account/premium/claim-trial` |
 | 5. 下载代理 | 拉取 `/v2/services/premium/proxy-list/{accountId}` 对应列表 |
-| 6. 远程上传 | 目标数量**全部成功**后，`PATCH` 上传 `keys/proxies.txt` |
-| 7. Web 管理 | 浏览器查看账号、试用到期、流量剩余，并一键发起注册 |
+| 6. 记录到期 | 用上一步已拿到的 overview 顺手缓存到期时间（`keys/account_details_cache.json`，零额外请求） |
+| 7. 代理 Feed | 远程订阅反向拉取 `GET /api/feed/proxies`（只读本地 per-account 文件，无网络请求） |
+| 8. 自动补齐 | 可供给账号数低于阈值时自动补注册（可选，`AUTO_REGISTER_*`） |
+| 9. Web 管理 | 浏览器查看账号、试用到期、流量剩余，并一键发起注册 |
 
-代理写入 **`keys/proxies.txt`（追加，不覆盖）**，适合批量多账号累积。
+代理写入 **`keys/proxies.txt`（追加，不覆盖）**，适合批量多账号累积；**feed 只读 `keys/proxies_{accountId}.txt`**（该文件按账号隔离，`proxies.txt` 只追加、永不清理，混有已死账号，因此绝不作为 feed 数据源）。
 
 ---
 
@@ -55,9 +57,10 @@ python web_app.py
 | `GET /api/accounts` | 账号列表（默认不打远程；`?live=1` 刷新详情） |
 | `POST /api/accounts/refresh` | `{"email":"..."}` 刷新单账号 overview；**JWT 过期时自动用密码+Turnstile 重登并写回 token** |
 | `GET /api/accounts/download-proxies?email=` | 下载该账号 proxy 文本（token 过期时同样自动重登） |
-| `GET /api/proxies/download-all` | 下载全部 proxies（一个文件） |
-| `POST /api/proxies/upload-resin` | `{"live":true}` 上传全部代理到 Resin |
+| `GET /api/proxies/download-all` | 下载全部 proxies（一个文件，人工用） |
+| `GET /api/feed/proxies` | **代理 Feed**（远程订阅拉取用）：`X-Feed-Token` 头或 `?token=` 鉴权 |
 | `POST /api/accounts/delete` | `{"email":"..."}` 删除账号及本地相关数据 |
+| `POST /api/accounts/delete-invalid` | `{"include_unknown":false}` 删除**已过期**账号（默认不动 `unknown`） |
 | `POST /api/accounts/delete-all` | 清空全部账号与本地代理文件 |
 | `POST /api/register` | `{"count":N}` 启动与 CLI 相同的 `register_accounts` |
 | `GET /api/register/status` | 注册任务状态 |
@@ -72,14 +75,16 @@ python web_app.py
 **Token 续期：** ProxyScrape JWT 约 24h 过期。过期后状态栏显示 `token过期`；点「刷新」或下载时会自动 `POST /v2/v4/account/auth/login`（需本机 Turnstile Solver），新 token 写回 `keys/proxyscrape_accounts.txt`。重登失败时若有旧缓存会标 `流量缓存`（数值可能不是最新）。  
 **详情缓存：** 刷新成功后的到期/流量会写入 `keys/account_details_cache.json`，刷新网页后仍会显示（无需重新点刷新）。流量展示按 SI（1000）与官网一致。  
 **下载全部 proxies：** 右上角按钮，优先实时汇总各账号，失败则回退 `keys/proxies.txt`。  
-**上传全部到 Resin：** 右上角按钮；确定=在线汇总后 PATCH 到订阅，取消=仅上传本地 `keys/proxies.txt`（需配置 `RESIN_*`）。  
-**注册日志：** 页面底部实时滚动输出 `register_accounts` 过程日志。  
-**配置页：** 管理台右上角「配置」→ `/config`，可改邮箱、Solver URL、Resin、注册间隔、`WEB_PASSWORD` 等并写回 `.env`（登录后全部明文；`WEB_HOST`/`WEB_PORT` 需重启进程）。
+**删除过期账号：** 右上角按钮，默认只删 `已过期`（`expired`）账号；可在第二个确认框里选择连 `到期时间未知`（`unknown`）的账号一起删。**不会自动删除任何账号**。  
+**注册日志：** 页面底部实时滚动输出 `register_accounts` 过程日志（含自动补齐调度日志）。  
+**配置页：** 管理台右上角「配置」→ `/config`，可改邮箱、Solver URL、`FEED_TOKEN`、`AUTO_REGISTER_*`、注册间隔、`WEB_PASSWORD` 等并写回 `.env`（登录后全部明文；`WEB_HOST`/`WEB_PORT` 需重启进程）。
 
-手动上传（CLI）：
+查看当前 feed 内容（需先配置 `FEED_TOKEN`）：
 
 ```bash
-python -c "from main import upload_proxies_to_resin; print(upload_proxies_to_resin())"
+curl 'http://127.0.0.1:5080/api/feed/proxies?token=<FEED_TOKEN>'
+# 或
+curl -H 'X-Feed-Token: <FEED_TOKEN>' http://127.0.0.1:5080/api/feed/proxies
 ```
 
 **Web 服务（含登录密码）：**
@@ -148,8 +153,13 @@ EMAIL_DOMAIN=example.com, example.org
 ```env
 EMAIL_SERVICE_TYPE=gptmail
 GPTMAIL_DOMAIN=可用域名列表
-GPTMAIL_API_KEY=你的key
+# 留空则自动从公开 key 接口获取（进程内缓存 1 小时，不回写 .env），失败时回退 gpt-test
+GPTMAIL_API_KEY=
+# 可选：覆盖公开 key 接口地址
+# GPTMAIL_PUBLIC_KEY_URL=https://mail.chatgpt.org.uk/api/public-key-status?reveal=1
 ```
+
+> GPTMail 的 key 只缓存在**进程内**，不会写回 `.env`——配置页里 `GPTMAIL_API_KEY` 始终保持你填写的值（或空）。
 
 ### 2. 注册参数
 
@@ -183,32 +193,60 @@ POST /v2/v4/account/premium/claim-trial
 
 此步骤不需要在 `.env` 配置额外 Token、Cookie 或浏览器请求头；激活失败会将账号标记为 `NO_PREMIUM_TRIAL`，且不会继续下载代理。
 
-### 4. 远程上传（Resin，可选）
+### 4. 代理 Feed（远程拉取，可选）
 
-批量**全部成功**后自动执行：
+本机**不做任何推送**：远程订阅（Resin 等）主动 `GET` 本机 feed 接口即可。
 
 ```env
-RESIN_SUBSCRIPTION_URL=https://resin.example.com/api/v1/subscriptions/<订阅UUID>
-RESIN_API_TOKEN=你的Bearer令牌
-RESIN_NAME=test
-RESIN_UPDATE_INTERVAL=12h
-RESIN_EPHEMERAL_NODE_EVICT_DELAY=72h0m0s
-RESIN_ENABLED=true
-RESIN_EPHEMERAL=false
-RESIN_INCREMENTAL_ALIVE_NODES=false
+# 留空 = 关闭 feed（接口返回 503，不会退化成匿名开放）
+FEED_TOKEN=换成一个足够长的随机串
 ```
 
-等价于：
+拉取方式（二选一）：
 
 ```bash
-curl 'https://resin.example.com/api/v1/subscriptions/<UUID>' \
-  -X PATCH \
-  -H 'authorization: Bearer <TOKEN>' \
-  -H 'content-type: application/json; charset=utf-8' \
-  --data-raw '{"name":"test","update_interval":"12h",...,"content":"<proxies.txt 全文>"}'
+curl -H 'X-Feed-Token: <FEED_TOKEN>' http://<本机IP>:5080/api/feed/proxies
+curl 'http://<本机IP>:5080/api/feed/proxies?token=<FEED_TOKEN>'
 ```
 
-未配置 `RESIN_SUBSCRIPTION_URL` / `RESIN_API_TOKEN` 时跳过上传，本地文件仍会保存。
+响应语义：
+
+| 情况 | 状态码 | 说明 |
+|------|--------|------|
+| `FEED_TOKEN` 未配置 | `503` | feed 未开启 |
+| token 不匹配 | `401` | 鉴权失败 |
+| 无可用代理 | `200` | **空 body**（不是错误） |
+| 正常 | `200` | `text/plain` 代理列表，一行一条 |
+
+响应头：`Cache-Control: no-store`、`X-Proxy-Count`（行数）、`X-Proxy-Accounts`（可供给账号数）、`X-Proxy-Errors`（被跳过的账号及原因）。
+
+数据来源与规则：
+
+- **只读本地** `keys/proxies_{accountId}.txt`，**不发任何网络请求、不重登、无副作用**；
+- 每个账号是否进 feed 只看**到期时间**：`expired` 排除，`valid` 和 `unknown`（从未刷新过详情）都算可用；
+- 行清洗：跳过 `#` 与空行、必须是 `protocol://user:pass@host:port`、且 scheme 仅限 `http`/`https`（`socks5://` 会被丢弃），并按出现顺序去重；
+- `proxies_{accountId}.txt` 是**追加**语义，所以同一行可能重复写入——feed 会去重。
+
+> 注意：feed 行在**注册下载那一刻就冻结**，之后不会自动刷新。若某个账号的 per-account 文件写残了，feed 不会自愈——需要重新下载该账号代理或删掉它。
+
+### 5. 自动补齐注册（可选）
+
+在 `web_app.py` 进程内按间隔检查「可供给账号数」（= 账号到期有效/未知 **且** per-account 代理文件存在且非空），低于阈值就自动补注册。
+
+```env
+AUTO_REGISTER_ENABLED=false   # 关闭时不做事（每 60s 空转一次以便即时生效）
+AUTO_REGISTER_INTERVAL=1800   # 检查间隔（秒），最小 30
+AUTO_REGISTER_TARGET=50       # 目标可供给账号数
+AUTO_REGISTER_MIN_VALID=10    # 低于该值才补齐
+AUTO_REGISTER_MAX_PER_ROUND=20 # 单轮最多注册数量
+```
+
+行为要点：
+
+- 与 `POST /api/register` 共用同一把锁，**绝不与手动注册并发**；
+- 触发口径是「可供给账号数」，不是 `success_count`（后者只是注册 API 成功数）；
+- **连续失败退避**：一轮结束后可供给账号数没有增加（典型原因：本地 Turnstile Solver 未启动，`register_accounts` 会立刻返回）时，下轮等待时间翻倍，最多 `6 × AUTO_REGISTER_INTERVAL`；一旦数量增加就复位；
+- **仅支持单进程运行**：调度器是 `web_app.py` 内的 daemon 线程。不要用 gunicorn/uvicorn 多 worker 启动本进程，否则会起多个调度器共享同一份 `keys/` 而并发写坏文件。
 
 ---
 
@@ -232,7 +270,7 @@ python api_solver.py --browser_type camoufox --thread 1 --debug
 | 机器 | 做什么 |
 |------|--------|
 | **A（Solver）** | 装浏览器依赖，跑 `api_solver.py`，对外暴露 5072 |
-| **B（注册）** | 配邮箱 / Resin，跑注册；`.env` 指向 A |
+| **B（注册）** | 配邮箱 / Feed，跑注册；`.env` 指向 A |
 
 **A 上：**
 
@@ -295,8 +333,8 @@ echo 5 | python main.py
 [*] 下载 proxy-list | format=protocol://user:pass@host:port
 [✓] 代理下载成功: ... | 100 条
 ...
-[*] 目标数量已全部完成，开始上传 keys/proxies.txt ...
-[✓] 远程上传成功: N 行 | HTTP 200
+[*] 结束，成功注册 N/N
+[*] 代理列表由 Resin 反向拉取本机 feed: GET /api/feed/proxies
 ```
 
 ### 第三步（可选）：已有账号单独下载代理
@@ -317,11 +355,18 @@ python download_proxies.py --token <JWT> --account-id <UUID>
 python download_proxies.py --protocol http
 ```
 
-### 手动上传 proxies.txt 到 Resin
+### 手动查看 / 拉取 feed
 
 ```bash
-python -c "from main import upload_proxies_to_resin; print(upload_proxies_to_resin())"
+# FEED_TOKEN 未配置时会返回 503
+curl -H 'X-Feed-Token: <FEED_TOKEN>' http://127.0.0.1:5080/api/feed/proxies
+
+# 只看行数与可供给账号数（不打印内容）
+curl -sD - -o /dev/null -H 'X-Feed-Token: <FEED_TOKEN>' \
+  http://127.0.0.1:5080/api/feed/proxies
 ```
+
+在远程订阅端把订阅地址填成 `http://<本机IP>:5080/api/feed/proxies?token=<FEED_TOKEN>` 即可（若订阅端支持自定义请求头，更推荐用 `X-Feed-Token`，避免 token 出现在访问日志里）。用 `docker-compose.yml` 起的话，宿主机端口是 **15080**（映射到容器内 5080）。
 
 ---
 
@@ -341,8 +386,8 @@ python -c "from main import upload_proxies_to_resin; print(upload_proxies_to_res
 
 ```text
 ProxyScrape/
-├── main.py                 # 注册 + 验证 + 问卷 + 激活试用 + 下载 + 远程上传
-├── web_app.py              # Web 管理台（账号 / 到期 / 流量 / 注册）
+├── main.py                 # 注册 + 验证 + 问卷 + 激活试用 + 下载 + 写详情缓存
+├── web_app.py              # Web 管理台（账号 / 到期 / 流量 / 注册 / Feed / 自动补齐）
 ├── download_proxies.py     # 已有账号单独下载代理
 ├── api_solver.py           # 本地 Turnstile Solver
 ├── requirements.txt
@@ -360,7 +405,9 @@ ProxyScrape/
     ├── test_proxyscrape_helpers.py
     ├── test_premium_trial_claim.py
     ├── test_account_web_helpers.py
-    └── test_env_config.py
+    ├── test_env_config.py
+    ├── test_feed_and_auto_register.py
+    └── test_gptmail_service.py
 ```
 
 ---
@@ -397,11 +444,27 @@ python -m unittest discover -s tests -v
 - 试用一般为 **HTTP only**，`PROXY_DOWNLOAD_PROTOCOL=http`
 - 检查 token 是否过期
 
-### 远程上传未执行
+### Feed 返回 503 / 401
 
-- 仅当 `成功数 >= 目标数量` 才会上传
-- 检查 `.env` 中 `RESIN_SUBSCRIPTION_URL`、`RESIN_API_TOKEN` 是否非空
-- 未达目标时本地 `proxies.txt` 仍会保留（追加）
+- `503` = `.env` 里 `FEED_TOKEN` 为空（feed 视为未开启，这是刻意的默认行为）
+- `401` = token 不匹配；检查订阅端带上的是 `X-Feed-Token` 头还是 `?token=`
+- `200` + 空 body = 配置正确但没有可供给的代理（不是错误）
+- 想看被跳过的账号原因，读响应头 `X-Proxy-Errors`
+
+### 自动补齐不生效 / 一直在退避
+
+- 确认 `AUTO_REGISTER_ENABLED=true`（默认 `false`），并查看注册日志里的 `[auto]` 行
+- 若日志出现「本轮未增加可供给账号 … 下轮等待 ×N」，通常是本地 Turnstile Solver 没启动：`register_accounts` 在验证码连续失败达到 `MAX_CAPTCHA_FAIL_ROUNDS` 时**立刻返回**，所以调度器会翻倍退避（上限 6×间隔）而不是原地空转
+- 可供给账号数只统计**同时有到期时间和非空 per-account 代理文件**的账号；注册成功但代理下载失败的账号不算
+
+### 忘记 / 丢失 FEED_TOKEN
+
+在 `/config` 页重新设置 `FEED_TOKEN` 并保存，**立即生效**（路由每次请求都重新读 `os.getenv`），无需重启。
+
+### 账号被删了但 feed 仍然供给它
+
+- `unknown`（从未刷新过详情 / overview 失败）按规则算有效，因此既会进 feed，也**不会**被「删除过期账号」清掉——这是「未知算有效」+「只删 expired」两条规则的必然结果
+- 需要清掉就用「删除过期账号」并选择 `include_unknown`，或单独删除该账号
 
 ### 密码不符合站点规则
 
@@ -416,6 +479,8 @@ python -m unittest discover -s tests -v
 2. 试用账号有代理数量、带宽与协议限制（例如试用约 100 条 HTTP、有流量上限）。
 3. `.env`、`keys/` 含密钥与凭证，**不要提交到公开仓库**。
 4. 批量注册注意间隔（`REGISTER_INTERVAL`），避免触发风控。
+5. **`web_app.py` 只支持单进程运行**：自动补齐调度器是进程内线程，且会写 `keys/`。用多 worker（gunicorn/uvicorn `--workers N`）会起多个调度器并发注册，写坏账号与代理文件。
+6. 旧的 `RESIN_*` 配置项已不再使用（推送链路已删除）；`.env` 里残留的 `RESIN_*` 是**无害**的，可自行清理。
 
 ---
 
@@ -425,7 +490,7 @@ python -m unittest discover -s tests -v
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 编辑 .env（邮箱 + 可选 Resin）
+# 2. 编辑 .env（邮箱 + 可选 FEED_TOKEN / 自动补齐）
 
 # 3. 终端 A：Solver（注册时需要）
 python api_solver.py

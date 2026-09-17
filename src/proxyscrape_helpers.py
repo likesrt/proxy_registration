@@ -6,6 +6,7 @@ import os
 import random
 import re
 import string
+import time
 from typing import Optional
 
 
@@ -575,30 +576,6 @@ def load_proxies_file_content(
     return "\n".join(lines) + "\n"
 
 
-def build_resin_subscription_payload(
-    content: str,
-    name: str = "proxyscrape",
-    update_interval: str = "12h",
-    ephemeral_node_evict_delay: str = "72h0m0s",
-    enabled: bool = True,
-    ephemeral: bool = False,
-    incremental_alive_nodes: bool = False,
-) -> dict:
-    """
-    JSON body for PATCH /api/v1/subscriptions/{id} (Resin / similar).
-    `content` is the proxy list text (protocol://user:pass@host:port lines).
-    """
-    return {
-        "name": name,
-        "update_interval": update_interval,
-        "ephemeral_node_evict_delay": ephemeral_node_evict_delay,
-        "enabled": bool(enabled),
-        "ephemeral": bool(ephemeral),
-        "incremental_alive_nodes": bool(incremental_alive_nodes),
-        "content": content if content.endswith("\n") or content == "" else content + "\n",
-    }
-
-
 def extract_register_success(response_json: dict) -> Optional[dict]:
     """
     Parse successful register JSON.
@@ -994,7 +971,7 @@ def format_unix_expiry(ts, now_ts: Optional[float] = None) -> dict:
     return {
         "expires_at_unix": n,
         "expires_at_iso": dt_utc.isoformat(),
-        "expires_at_display": dt_bj.strftime("%Y-%m-%d %H:%M"),
+        "expires_at_display": dt_bj.strftime("%Y-%m-%d %H:%M") + " 北京时间",
         "expires_in_seconds": remaining,
         "expires_countdown": format_countdown(remaining),
         "is_expired": remaining <= 0,
@@ -1184,6 +1161,208 @@ def collect_related_proxy_files(
         except OSError:
             continue
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Read-only proxy feed: expiry state + local per-account proxy collection
+# ---------------------------------------------------------------------------
+
+EXPIRY_STATE_VALID = "valid"
+EXPIRY_STATE_EXPIRED = "expired"
+EXPIRY_STATE_UNKNOWN = "unknown"
+
+# Feed only serves http(s) lines; is_protocol_url_proxy_line would also accept socks5://
+FEED_PROTOCOLS = ("http", "https")
+
+
+def account_expiry_state(entry, now_ts: Optional[float] = None) -> str:
+    """
+    Classify a cached details entry as 'expired' | 'valid' | 'unknown'.
+
+    Recomputed from details.expires_at_unix against `now_ts` — the cached
+    is_expired / expires_in_seconds fields are never trusted (they go stale in
+    the on-disk cache). No cache entry, or no expires_at_unix, is 'unknown'
+    (unknown counts as usable: we cannot prove the account is dead).
+    """
+    if not isinstance(entry, dict):
+        return EXPIRY_STATE_UNKNOWN
+    details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
+    raw = details.get("expires_at_unix")
+    if raw is None or raw == "":
+        return EXPIRY_STATE_UNKNOWN
+    try:
+        n = int(float(raw))
+    except (TypeError, ValueError):
+        return EXPIRY_STATE_UNKNOWN
+    if n > 10_000_000_000:  # ms
+        n = n // 1000
+    if now_ts is None:
+        now_ts = time.time()
+    try:
+        now = float(now_ts)
+    except (TypeError, ValueError):
+        now = time.time()
+    return EXPIRY_STATE_EXPIRED if n <= now else EXPIRY_STATE_VALID
+
+
+def resolve_cached_account_id(entry) -> str:
+    """
+    Account id used for keys/proxies_{id}.txt naming.
+
+    Prefer entry['subaccount_id'] — it comes from /me, the same source main.py
+    uses when writing the per-account file. details['account_id'] comes from
+    overview data.id and is NOT provably the same value.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    sid = entry.get("subaccount_id")
+    if sid and str(sid).strip():
+        return str(sid).strip()
+    details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
+    aid = details.get("account_id")
+    return str(aid).strip() if aid else ""
+
+
+def _read_feed_proxy_lines(path: str, protocols) -> list:
+    """Cleaned proxy lines from one file: skip blanks/#, require protocol://…@…:port."""
+    allowed = {str(p).strip().lower() for p in (protocols or ()) if str(p).strip()}
+    lines = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if not is_protocol_url_proxy_line(line):
+                    continue
+                scheme = line.split("://", 1)[0].lower()
+                if allowed and scheme not in allowed:
+                    continue
+                lines.append(line)
+    except OSError:
+        return []
+    return lines
+
+
+def _find_account_proxy_file(
+    email: str,
+    account_id: str,
+    keys_dir: str,
+) -> Optional[str]:
+    """Path of the per-account proxy file for this account, or None."""
+    if account_id:
+        direct = os.path.join(
+            keys_dir, f"proxies_{_safe_account_id_filename(account_id)}.txt"
+        )
+        if os.path.isfile(direct):
+            return direct
+    related = collect_related_proxy_files(email, account_id=account_id, keys_dir=keys_dir)
+    return related[0] if related else None
+
+
+def collect_valid_proxy_lines(
+    accounts: Optional[list] = None,
+    cache: Optional[dict] = None,
+    keys_dir: str = KEYS_DIR,
+    now_ts: Optional[float] = None,
+    protocols=FEED_PROTOCOLS,
+) -> dict:
+    """
+    Read-only, side-effect-free proxy feed source.
+
+    Reads ONLY keys/proxies_{accountId}.txt per account — never keys/proxies.txt
+    (that file is append-only and never pruned, so it holds dead accounts too).
+    Makes no network requests.
+
+    Returns:
+      lines: ordered, de-duplicated proxy lines from non-expired accounts
+      accounts: per-account rows {email, account_id, proxy_file, state,
+                 reason, line_count}
+      valid_count / expired_count / unknown_count: accounts by expiry state
+      feed_eligible_count: accounts that are usable AND have a non-empty
+                 per-account proxy file (this is the "how many can I serve" number)
+      skipped_count: usable accounts whose proxy file is missing or empty
+    """
+    if accounts is None:
+        accounts = load_accounts_from_file()
+    if cache is None:
+        cache = load_account_details_cache()
+    cache = cache if isinstance(cache, dict) else {}
+
+    feed_lines: list = []
+    seen: set = set()
+    rows: list = []
+    valid_count = 0
+    expired_count = 0
+    unknown_count = 0
+    feed_eligible_count = 0
+    skipped_count = 0
+
+    for acc in accounts or []:
+        if not isinstance(acc, dict):
+            continue
+        email = (acc.get("email") or "").strip()
+        if not email:
+            continue
+        entry = cache.get(email.lower())
+        state = account_expiry_state(entry, now_ts=now_ts)
+        account_id = resolve_cached_account_id(entry)
+
+        if state == EXPIRY_STATE_VALID:
+            valid_count += 1
+        elif state == EXPIRY_STATE_EXPIRED:
+            expired_count += 1
+        else:
+            unknown_count += 1
+
+        proxy_file = None
+        line_count = 0
+        reason = ""
+
+        if state == EXPIRY_STATE_EXPIRED:
+            reason = "expired"
+        else:
+            path = _find_account_proxy_file(email, account_id, keys_dir)
+            if not path:
+                reason = "no_proxy_file"
+            else:
+                proxy_file = path
+                found = _read_feed_proxy_lines(path, protocols)
+                if not found:
+                    reason = "empty_proxy_file"
+                else:
+                    for line in found:
+                        if line in seen:
+                            continue
+                        seen.add(line)
+                        feed_lines.append(line)
+                        line_count += 1
+
+        if reason == "":
+            feed_eligible_count += 1
+        elif state != EXPIRY_STATE_EXPIRED:
+            skipped_count += 1
+
+        rows.append(
+            {
+                "email": email,
+                "account_id": account_id or None,
+                "proxy_file": os.path.basename(proxy_file) if proxy_file else None,
+                "state": state,
+                "reason": reason,
+                "line_count": line_count,
+            }
+        )
+
+    return {
+        "lines": feed_lines,
+        "accounts": rows,
+        "valid_count": valid_count,
+        "feed_eligible_count": feed_eligible_count,
+        "expired_count": expired_count,
+        "unknown_count": unknown_count,
+        "skipped_count": skipped_count,
+    }
 
 
 def filter_proxy_lines_excluding(

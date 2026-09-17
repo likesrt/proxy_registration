@@ -21,7 +21,6 @@ from src.proxyscrape_helpers import (
     save_account_credentials,
     save_proxy_lines,
     load_proxies_file_content,
-    build_resin_subscription_payload,
     format_account_line,
     format_proxy_line,
     build_register_form_fields,
@@ -35,6 +34,7 @@ from src.proxyscrape_helpers import (
     is_protocol_url_proxy_line,
     pick_subaccount_id,
     proxy_list_download_url,
+    collect_valid_proxy_lines,
 )
 
 
@@ -286,7 +286,7 @@ class TestProxyDownloadHelpers(unittest.TestCase):
             self.assertIn("http://u:p@2.2.2.2:2", body)
             self.assertEqual(len([ln for ln in body.splitlines() if ln.strip()]), 2)
 
-    def test_load_and_resin_payload(self):
+    def test_load_proxies_file_content(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "proxies.txt")
             with open(path, "w", encoding="utf-8") as f:
@@ -295,12 +295,173 @@ class TestProxyDownloadHelpers(unittest.TestCase):
             self.assertNotIn("#", content)
             self.assertTrue(content.endswith("\n"))
             self.assertIn("http://u:p@1.2.3.4:3129", content)
-            payload = build_resin_subscription_payload(content, name="test")
-            self.assertEqual(payload["name"], "test")
-            self.assertEqual(payload["update_interval"], "12h")
-            self.assertTrue(payload["enabled"])
-            self.assertFalse(payload["ephemeral"])
-            self.assertEqual(payload["content"], content)
+            self.assertIn("http://u:p@5.6.7.8:3129", content)
+            # missing file → empty string, no exception
+            self.assertEqual(
+                load_proxies_file_content(os.path.join(td, "nope.txt")), ""
+            )
+
+    def test_load_proxies_file_content_empty_or_comment_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "proxies.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# only a comment\n\n")
+            self.assertEqual(load_proxies_file_content(path), "")
+
+
+class TestCollectValidProxyLines(unittest.TestCase):
+    """Feed source: local per-account files, expiry-gated, no network."""
+
+    NOW = 1_700_000_000
+
+    def _make_keys(self, td):
+        """valid account file with a duplicate, a comment, and a socks5 line."""
+        with open(os.path.join(td, "proxies_aid-valid.txt"), "w", encoding="utf-8") as f:
+            f.write(
+                "# email=v@x.com accountId=aid-valid\n"
+                "http://u:p@1.1.1.1:1\n"
+                "socks5://u:p@2.2.2.2:2\n"
+                "http://u:p@1.1.1.1:1\n"
+                "not-a-proxy-line\n"
+                "\n"
+            )
+        with open(os.path.join(td, "proxies_aid-unknown.txt"), "w", encoding="utf-8") as f:
+            f.write("https://u:p@3.3.3.3:3\n")
+        # empty file → usable account but nothing to serve
+        open(os.path.join(td, "proxies_aid-empty.txt"), "w", encoding="utf-8").close()
+
+    def _snap(self, td):
+        accounts = [
+            {"email": "v@x.com"},       # valid + file
+            {"email": "e@x.com"},       # expired + file
+            {"email": "u@x.com"},       # unknown (no expires_at_unix) + file
+            {"email": "m@x.com"},       # no cache entry at all
+            {"email": "f@x.com"},       # valid but file missing
+            {"email": "z@x.com"},       # valid but file empty
+        ]
+        cache = {
+            "v@x.com": {
+                "subaccount_id": "aid-valid",
+                "details": {"ok": True, "expires_at_unix": self.NOW + 3600},
+            },
+            "e@x.com": {
+                "subaccount_id": "aid-expired",
+                "details": {"ok": True, "expires_at_unix": self.NOW - 10},
+            },
+            "u@x.com": {
+                "subaccount_id": "aid-unknown",
+                "details": {"ok": True},
+            },
+            "f@x.com": {
+                "subaccount_id": "aid-missing",
+                "details": {"ok": True, "expires_at_unix": self.NOW + 3600},
+            },
+            "z@x.com": {
+                "subaccount_id": "aid-empty",
+                "details": {"ok": True, "expires_at_unix": self.NOW + 3600},
+            },
+        }
+        return collect_valid_proxy_lines(
+            accounts=accounts, cache=cache, keys_dir=td, now_ts=self.NOW
+        )
+
+    def test_expired_excluded_unknown_included(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_keys(td)
+            with open(
+                os.path.join(td, "proxies_aid-expired.txt"), "w", encoding="utf-8"
+            ) as f:
+                f.write("http://u:p@9.9.9.9:9\n")
+            snap = self._snap(td)
+
+            self.assertNotIn("http://u:p@9.9.9.9:9", snap["lines"])
+            self.assertIn("http://u:p@1.1.1.1:1", snap["lines"])
+            # BOTH unknown flavours are served: no expires_at_unix, and no cache entry
+            self.assertIn("https://u:p@3.3.3.3:3", snap["lines"])
+
+            by_email = {r["email"]: r for r in snap["accounts"]}
+            self.assertEqual(by_email["e@x.com"]["state"], "expired")
+            self.assertEqual(by_email["e@x.com"]["reason"], "expired")
+            self.assertEqual(by_email["u@x.com"]["state"], "unknown")
+            self.assertEqual(by_email["m@x.com"]["state"], "unknown")
+            self.assertEqual(by_email["v@x.com"]["state"], "valid")
+
+    def test_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_keys(td)
+            snap = self._snap(td)
+            # valid: v, f, z — expired: e — unknown: u, m
+            self.assertEqual(snap["valid_count"], 3)
+            self.assertEqual(snap["expired_count"], 1)
+            self.assertEqual(snap["unknown_count"], 2)
+            # served: v (file) + u (file); m has no cache → no account_id → no file
+            self.assertEqual(snap["feed_eligible_count"], 2)
+            # usable but unservable: f (missing file), z (empty file), m (no file)
+            self.assertEqual(snap["skipped_count"], 3)
+
+    def test_line_cleaning_and_dedupe(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._make_keys(td)
+            snap = self._snap(td)
+            self.assertNotIn("socks5://u:p@2.2.2.2:2", snap["lines"])
+            self.assertNotIn("not-a-proxy-line", snap["lines"])
+            self.assertEqual(snap["lines"].count("http://u:p@1.1.1.1:1"), 1)
+            by_email = {r["email"]: r for r in snap["accounts"]}
+            self.assertEqual(by_email["v@x.com"]["line_count"], 1)
+            self.assertEqual(by_email["v@x.com"]["proxy_file"], "proxies_aid-valid.txt")
+
+    def test_never_reads_shared_proxies_txt(self):
+        """proxies.txt is append-only and holds dead accounts — feed must ignore it."""
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "proxies.txt"), "w", encoding="utf-8") as f:
+                f.write("http://dead:p@6.6.6.6:6\n")
+            snap = collect_valid_proxy_lines(
+                accounts=[{"email": "n@x.com"}],
+                cache={},
+                keys_dir=td,
+                now_ts=self.NOW,
+            )
+            self.assertEqual(snap["lines"], [])
+            self.assertEqual(snap["feed_eligible_count"], 0)
+
+    def test_account_id_prefers_subaccount_id(self):
+        from src.proxyscrape_helpers import resolve_cached_account_id
+
+        # subaccount_id (from /me) wins — it is what the filename was built from
+        self.assertEqual(
+            resolve_cached_account_id(
+                {"subaccount_id": "from-me", "details": {"account_id": "from-overview"}}
+            ),
+            "from-me",
+        )
+        self.assertEqual(
+            resolve_cached_account_id({"details": {"account_id": "from-overview"}}),
+            "from-overview",
+        )
+        self.assertEqual(resolve_cached_account_id(None), "")
+        self.assertEqual(resolve_cached_account_id({}), "")
+
+    def test_expiry_state_recomputes_and_ignores_stale_cache(self):
+        from src.proxyscrape_helpers import account_expiry_state
+
+        # stale cached is_expired must not be trusted; expires_at_unix is authoritative
+        stale_ok = {"details": {"expires_at_unix": self.NOW + 10, "is_expired": True}}
+        self.assertEqual(account_expiry_state(stale_ok, now_ts=self.NOW), "valid")
+        stale_dead = {"details": {"expires_at_unix": self.NOW - 10, "is_expired": False}}
+        self.assertEqual(account_expiry_state(stale_dead, now_ts=self.NOW), "expired")
+        # milliseconds are normalised
+        self.assertEqual(
+            account_expiry_state(
+                {"details": {"expires_at_unix": (self.NOW + 10) * 1000}},
+                now_ts=self.NOW,
+            ),
+            "valid",
+        )
+        self.assertEqual(account_expiry_state({}, now_ts=self.NOW), "unknown")
+        self.assertEqual(
+            account_expiry_state({"details": {"expires_at_unix": "junk"}}, now_ts=self.NOW),
+            "unknown",
+        )
 
 
 class TestMainModuleNoGrok(unittest.TestCase):
@@ -322,7 +483,9 @@ class TestMainModuleNoGrok(unittest.TestCase):
         self.assertIn("login_http", src)
         self.assertIn("re_login_account", src)
         self.assertIn("ensure_fresh_access_token", src)
-        self.assertIn("upload_proxies_to_resin", src)
+        self.assertNotIn("upload_proxies_to_resin", src)
+        self.assertNotIn("build_resin_subscription_payload", src)
+        self.assertNotIn("RESIN_", src)
         self.assertIn("protocol://user:pass@host:port", src)
         self.assertNotIn("accounts.x.ai", src)
         self.assertNotIn("auth_mgmt.AuthManagement", src)

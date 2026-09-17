@@ -36,6 +36,9 @@ from .proxyscrape_helpers import (
     normalize_overview_payload,
     merge_account_with_details,
     format_bytes_human,
+    account_expiry_state,
+    resolve_cached_account_id,
+    collect_valid_proxy_lines,
 )
 
 __all__ = [
@@ -73,4 +76,7 @@ __all__ = [
     "normalize_overview_payload",
     "merge_account_with_details",
     "format_bytes_human",
+    "account_expiry_state",
+    "resolve_cached_account_id",
+    "collect_valid_proxy_lines",
 ]
