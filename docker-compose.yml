@@ -4,7 +4,7 @@ services:
     build:
       context: .
       args:
-        REPO_URL: https://github.com/aizhiqian/proxy_registration
+        REPO_URL: https://github.com/likesrt/proxy_registration
         REPO_REF: main
         # GITHUB_TOKEN: ""     # 仓库为私有时才需要
     command: ["python", "api_solver.py", "--browser_type", "camoufox",

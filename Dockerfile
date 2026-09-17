@@ -6,7 +6,7 @@
 ####################################################################
 FROM python:3.12-slim-bookworm AS src
 
-ARG REPO_URL=https://github.com/aizhiqian/proxy_registration
+ARG REPO_URL=https://github.com/likesrt/proxy_registration
 ARG REPO_REF=main
 ARG GITHUB_TOKEN=
 # CACHEBUST 的唯一作用：值变了 -> 这层缓存失效 -> 重新 git fetch。
