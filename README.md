@@ -176,8 +176,14 @@ PROXY=
 # 可选：非交互指定注册数量（也可用命令行/stdin）
 # REGISTER_COUNT=10
 
-# 可选：Turnstile 连续失败轮数上限
+# 可选：Turnstile 人机验证连续失败多少个账号后停止注册（识别本地 solver 未启动）
 # MAX_CAPTCHA_FAIL_ROUNDS=3
+
+# 邮箱验证码轮询（详见「验证邮件迟迟收不到」）
+# VERIFY_POLL_WINDOW=180          # 总窗口(秒)，下限 = VERIFY_RESEND_AFTER + 30
+# VERIFY_RESEND_AFTER=120         # 重发延后(秒)，站点限制每 2 分钟一次，低于 120 自动抬到 120
+# VERIFY_EMPTY_ABORT_FETCHES=10   # 连续空收件箱多少次提前放弃本轮，0 = 不提前放弃
+# VERIFY_POLL_INTERVAL=2          # 取信间隔(秒)
 
 # 代理下载协议：试用账号一般为 http
 PROXY_DOWNLOAD_PROTOCOL=http
@@ -447,6 +453,7 @@ ProxyScrape/
     ├── test_env_config.py
     ├── test_feed_and_auto_register.py
     ├── test_email_blacklist.py
+    ├── test_verification_poll.py
     └── test_gptmail_service.py
 ```
 
@@ -465,7 +472,7 @@ python -m unittest discover -s tests -v
 ### Turnstile / CAPTCHA 失败
 
 - 确认 Solver 已启动；本机默认 `http://127.0.0.1:5072`，分机请检查 `TURNSTILE_SOLVER_URL` 是否可达
-- 连续失败会按 `MAX_CAPTCHA_FAIL_ROUNDS` 停止（默认 3）
+- 连续失败会按 `MAX_CAPTCHA_FAIL_ROUNDS` 停止（默认 3）。注意它统计的是**人机验证**连续失败的账号数，和邮箱验证码（`VERIFY_*`）无关
 
 ### 收不到验证码
 
@@ -494,7 +501,7 @@ python -m unittest discover -s tests -v
 ### 自动补齐不生效 / 一直在退避
 
 - 确认 `AUTO_REGISTER_ENABLED=true`（默认 `false`），并查看注册日志里的 `[auto]` 行
-- 若日志出现「本轮未增加可供给账号 … 下轮等待 ×N」，通常是本地 Turnstile Solver 没启动：`register_accounts` 在验证码连续失败达到 `MAX_CAPTCHA_FAIL_ROUNDS` 时**立刻返回**，所以调度器会翻倍退避（上限 6×间隔）而不是原地空转
+- 若日志出现「本轮未增加可供给账号 … 下轮等待 ×N」，通常是本地 Turnstile Solver 没启动：`register_accounts` 在 Turnstile 连续失败达到 `MAX_CAPTCHA_FAIL_ROUNDS` 时**立刻返回**，所以调度器会翻倍退避（上限 6×间隔）而不是原地空转
 - 可供给账号数只统计**同时有到期时间和非空 per-account 代理文件**的账号；注册成功但代理下载失败的账号不算
 
 ### 忘记 / 丢失 FEED_TOKEN
@@ -510,9 +517,28 @@ python -m unittest discover -s tests -v
 
 - 配置页「邮箱黑名单」里删掉那一行再保存即可解封（`.env` 的 `EMAIL_BLACKLIST`，逗号分隔）
 - 不想自动拉黑就把 `EMAIL_BLACKLIST_AUTO` 设为 `false`（手工名单仍然生效）；这两个值都是 `.env` 文件优先，改完保存即生效，无需重启
-- 自动拉黑**只认** `not eligible for the free trial` 这句；其它失败（超时、限流、401）不会动名单
+- 自动拉黑有**两个触发源**：
+  - 站点返回 `not eligible for the free trial`（试用不合格）；
+  - 邮件服务商返回 `400 Unsupported email domain`（该域名 MX 失效被停用）——命中后立刻拉黑该根域并结束本轮，不再空转轮询。
+  两者都遵守同一套规则（开关 / 取根域 / 公共后缀保护 / 一次即封）。其它失败（超时、限流、401、收件箱为空）**不会**动名单——收件箱为空只提前结束本轮，不拉黑，因为可能只是邮件延迟。
 - 若日志出现「域名为公共后缀 … 拒绝加入黑名单」，说明该邮箱域名本身就是公共后缀（如 `eu.org`），程序故意不封，避免误伤同后缀的其他用户
 - 若日志出现「GPTMail 连续 5 次只分配到黑名单域名（连续 n/5 轮）」，说明服务端随机分配（`GPTMAIL_DOMAIN` 为空）连续抽到黑名单域名：程序会先重试，连续 5 轮都如此才停止注册；把黑名单里相关的后缀解封、或给 `GPTMAIL_DOMAIN` 配一批可用域名即可恢复
+
+### 验证邮件迟迟收不到 / 日志刷 `Unsupported email domain`
+
+邮箱验证是当前最耗时的一环（每账号等待窗口 180 秒），相关参数都在配置页「注册」分组：
+
+```env
+VERIFY_POLL_WINDOW=180          # 拉取验证邮件的总时长（下限 = 重发延后 + 30 秒）
+VERIFY_RESEND_AFTER=120         # 首次发信后多久重发（站点限制每 2 分钟一次，低于 120 自动抬到 120）
+VERIFY_EMPTY_ABORT_FETCHES=10   # 连续 10 次取到空收件箱就提前结束本轮（约 20 秒）；0 = 不提前放弃
+VERIFY_POLL_INTERVAL=2          # 每次取信间隔（秒）
+```
+
+- **`Unsupported email domain`**：该域名的 MX 记录已失效、被 GPTMail 停用，属于域名级确定性失败。程序会立刻把该根域加入黑名单并结束本轮，不再把 180 秒窗口耗完。由于取的是根域，一次拉黑可同时拦住同根域的其他账号（例如 `brtfsbht.xjcnsdevg.de5.net` 与 `bwm.de5.net` → 记 `de5.net`）
+- **收件箱持续为空**：连续 `VERIFY_EMPTY_ABORT_FETCHES` 次取到空就提前放弃本轮，不必等满窗口；不会拉黑域名（邮件延迟是常见原因）
+- **重发时机**：站点限制验证码每 2 分钟只能重发一次。旧实现约 25 秒就重发、且整个窗口只有约 89 秒（< 120 秒冷却），因此重发**必然**被 400 拒绝、每个账号最多只能发出一封信；现在窗口 180 秒、重发在 120 秒后进行，重发后仍留 60 秒收信
+- 服务端随机分配域名（`GPTMAIL_DOMAIN` 为空）抽的是公共域名池（`/api/stats` 显示约 1500+ 个），成员随时可能因 MX 失效被停用。**长期稳定运行建议给 `GPTMAIL_DOMAIN` 配一批已验证可用的域名**，既绕开失效域名，也省掉一次 `generate-email` 调用
 
 ### 密码不符合站点规则
 

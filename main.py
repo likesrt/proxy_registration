@@ -22,6 +22,7 @@ from src import (
     TurnstileService,
     AllDomainsBlacklisted,
     BlockedEmailRetriesExhausted,
+    UnsupportedEmailDomain,
     auto_block_enabled,
     block_domain,
 )
@@ -678,15 +679,24 @@ def is_trial_ineligible(message) -> bool:
     return bool(TRIAL_INELIGIBLE_RE.search(str(message or "")))
 
 
-def blacklist_trial_domain(email: str, message) -> dict:
+def auto_blacklist_domain(email: str) -> dict:
     """
-    试用失败且文案确认是「地址无资格」时，把该邮箱的域名加入黑名单（一次即封）。
+    按配置把该邮箱的域名加入黑名单（自动拉黑的公共入口，一次即封）。
 
-    只有站点明确返回 not eligible for the free trial 才触发；
-    401/429/5xx 之类的瞬时失败不会拉黑整个后缀。
+    参数:
+        email: 邮箱地址；内部取可注册根域（eTLD+1）后写入 ``EMAIL_BLACKLIST``。
+
+    返回:
+        ``block_domain`` 的结果 ``{"ok", "added", "entry", "error"}``，
+        以及自动拉黑被关闭时的 ``error="disabled"``。
+
+    边界条件:
+        - ``EMAIL_BLACKLIST_AUTO=false`` 时只打印日志、不写名单；
+        - 公共后缀（eu.org 等）由 ``block_domain`` 拒绝，日志说明原因；
+        - 已在名单中时不重复写入（幂等），仅提示。
+
+    副作用: 写 ``.env``；打印一行状态日志。
     """
-    if not is_trial_ineligible(message):
-        return {"ok": False, "added": False, "entry": "", "error": "not_ineligible"}
     if not auto_block_enabled():
         print("[*] 邮箱黑名单自动加入已关闭（EMAIL_BLACKLIST_AUTO=false），跳过")
         return {"ok": False, "added": False, "entry": "", "error": "disabled"}
@@ -707,6 +717,30 @@ def blacklist_trial_domain(email: str, message) -> dict:
     else:
         print(f"[!] {email} 域名无法加入黑名单: {result.get('error')}")
     return result
+
+
+def blacklist_trial_domain(email: str, message) -> dict:
+    """
+    试用失败且文案确认是「地址无资格」时，把该邮箱的域名加入黑名单（一次即封）。
+
+    只有站点明确返回 not eligible for the free trial 才触发；
+    401/429/5xx 之类的瞬时失败不会拉黑整个后缀。
+    """
+    if not is_trial_ineligible(message):
+        return {"ok": False, "added": False, "entry": "", "error": "not_ineligible"}
+    return auto_blacklist_domain(email)
+
+
+def blacklist_unsupported_domain(email: str) -> dict:
+    """
+    邮件服务商声明不支持该收件域名时，把域名加入黑名单（一次即封）。
+
+    触发源是 GPTMail 收件接口的 400 ``Unsupported email domain``：该域名 MX 失效后
+    被停用，属于域名级确定性失败——重发验证码、继续轮询都不会有信。
+    拉黑规则与试用不合格完全一致（开关 / 根域 / 公共后缀保护 / 幂等）。
+    """
+    print(f"[!] {email} 邮件服务商不支持该收件域名（Unsupported email domain）")
+    return auto_blacklist_domain(email)
 
 
 # 服务端随机分配域名时（GPTMAIL_DOMAIN 为空），单轮命中的只是「这次抽到的域名」，
@@ -759,13 +793,197 @@ def acquire_email(email_service, blocked_rounds: int = 0) -> dict:
 
 
 def fetch_inbox_content(email_service, jwt, email: str, email_service_type: str):
+    """
+    拉取临时邮箱的邮件内容，屏蔽普通异常。
+
+    参数:
+        email_service: EmailService / GPTMailService 实例。
+        jwt: Cloudflare Worker 服务的 jwt；GPTMail 不使用。
+        email: 邮箱地址（GPTMail 必需）。
+        email_service_type: "gptmail" 或其它（走 Worker 分支）。
+
+    返回:
+        邮件正文；收件箱为空或一般异常时返回 None。
+
+    异常:
+        UnsupportedEmailDomain 原样抛出——它是域名级硬失败，必须让调用方
+        拉黑该域名并结束本轮，不能被这里的兜底 except 吞掉。
+    """
     try:
         if email_service_type == "gptmail":
             return email_service.fetch_first_email(jwt, email=email)
         return email_service.fetch_first_email(jwt)
+    except UnsupportedEmailDomain:
+        raise
     except Exception as e:
         print(f"[-] 拉取邮件异常: {e}")
         return None
+
+
+# 邮箱验证轮询默认参数（可用环境变量覆盖，配置页可直接改）
+# 站点限制验证码每 2 分钟只能重发一次，所以窗口必须留出"重发之后还能收信"的余量，
+# 否则重发等于白做（旧实现窗口仅 ~89s，重发必然撞 400，已修正）。
+_VERIFY_DEFAULT_INTERVAL = 2.0
+_VERIFY_DEFAULT_WINDOW = 180.0
+_VERIFY_DEFAULT_RESEND_AFTER = 120.0
+# 连续空收件箱 10 次（约 20s）即换号：兼顾"邮件延迟几十秒"与"坏域名别白等"
+_VERIFY_DEFAULT_EMPTY_ABORT = 10
+
+# 失败原因 → 日志文案（供注册主循环复用）
+_VERIFY_FAIL_TEXT = {
+    "timeout": "轮询窗口内未解析到验证码",
+    "empty_inbox": "收件箱持续为空，提前放弃本轮",
+    "unsupported_domain": "邮件服务商不支持该收件域名（已拉黑）",
+    "stopped": "用户请求停止",
+}
+
+
+def _verify_env_number(name: str, default: float) -> float:
+    """
+    读取数值型环境变量。
+
+    参数:
+        name: 环境变量名。
+        default: 未设置或非法时的回退值。
+
+    返回:
+        float 值；配置页允许留空，留空或非数字时回退默认（并打印一次提示），不抛异常。
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[!] {name}={raw!r} 不是数字，按默认 {default} 处理")
+        return default
+
+
+def _verify_poll_config() -> dict:
+    """
+    组装验证码轮询参数（每次轮询都重读，配置页改完即生效）。
+
+    返回:
+        ``{"interval", "window", "resend_after", "empty_abort"}``：
+        - interval: 取信间隔（秒），下限 1；
+        - resend_after: 首次发信后多久重发，下限 120（站点冷却要求）；
+        - window: 整个轮询窗口（秒），下限 ``resend_after + 30``，保证重发后还有收信时间；
+        - empty_abort: 连续取到空收件箱多少次放弃本轮，<=0 表示不启用该提前退出。
+    """
+    interval = max(
+        1.0, _verify_env_number("VERIFY_POLL_INTERVAL", _VERIFY_DEFAULT_INTERVAL)
+    )
+    resend_after = max(
+        120.0, _verify_env_number("VERIFY_RESEND_AFTER", _VERIFY_DEFAULT_RESEND_AFTER)
+    )
+    window = max(
+        resend_after + 30.0,
+        _verify_env_number("VERIFY_POLL_WINDOW", _VERIFY_DEFAULT_WINDOW),
+    )
+    empty_abort = int(
+        _verify_env_number("VERIFY_EMPTY_ABORT_FETCHES", _VERIFY_DEFAULT_EMPTY_ABORT)
+    )
+    return {
+        "interval": interval,
+        "window": window,
+        "resend_after": resend_after,
+        "empty_abort": empty_abort,
+    }
+
+
+def _verify_result(reason: str, code=None, domain_blocked: bool = False) -> dict:
+    """组装轮询返回结构 ``{"code", "reason", "domain_blocked"}``。"""
+    return {"code": code, "reason": reason, "domain_blocked": domain_blocked}
+
+
+def request_verification_mail(session, access_token, email: str, label: str) -> bool:
+    """
+    请求站点发送验证邮件（首次发信 / 冷却满足后的重发共用）。
+
+    参数:
+        session: 站点会话；None 时不做任何事。
+        access_token: 站点 access_token；为空时不请求。
+        email: 仅用于日志的邮箱地址。
+        label: 日志动作文案（如 "请求发送邮箱验证码" / "再次请求发信"）。
+
+    返回:
+        请求是否被站点接受。站点对 2 分钟内的重复请求返回 400，
+        调用方只在冷却满足后重发，正常不会触发该分支。
+
+    副作用: 发起一次 HTTP 请求并打印结果。
+    """
+    if session is None or not access_token:
+        return False
+    print(f"[*] {email} {label} (reset-verification-code)...")
+    rr = resend_verification_code(session, access_token)
+    print(f"[*] {email} 发信结果 ({rr['status']}): {rr['message']}")
+    return bool(rr.get("ok"))
+
+
+def _poll_verification_loop(
+    email_service, jwt, email, email_service_type, cfg, session, access_token
+):
+    """
+    轮询收件箱直到拿到验证码、判定失败或超时（``poll_verification_code`` 的主循环）。
+
+    参数:
+        email_service / jwt / email / email_service_type: 见 ``poll_verification_code``。
+        cfg: ``_verify_poll_config()`` 的结果。
+        session / access_token: 站点会话与令牌，用于冷却满足后重发。
+
+    返回:
+        ``_verify_result(...)``；reason 为 ok / timeout / empty_inbox /
+        unsupported_domain / stopped。
+
+    副作用: 网络取信、按需重发、打印进度；unsupported_domain 时写黑名单。
+    """
+    started = time.monotonic()
+    deadline = started + cfg["window"]
+    resend_at = started + cfg["resend_after"]
+    resend_done = False
+    empty_streak = 0
+    last_raw_len = 0
+    attempt = 0
+
+    while time.monotonic() < deadline:
+        if stop_flag:
+            return _verify_result("stopped")
+        time.sleep(cfg["interval"] if attempt else 1.0)
+        attempt += 1
+        try:
+            content = fetch_inbox_content(email_service, jwt, email, email_service_type)
+        except UnsupportedEmailDomain as e:
+            print(f"[-] {email} 取信被拒 ({e})")
+            blocked = blacklist_unsupported_domain(email)
+            return _verify_result(
+                "unsupported_domain", domain_blocked=bool(blocked.get("added"))
+            )
+
+        if content:
+            empty_streak = 0
+            if len(content) != last_raw_len:
+                last_raw_len = len(content)
+                print(f"[*] {email} 收到邮件 (len={len(content)})，解析验证码...")
+            code = parse_verification_code(content)
+            if code:
+                return _verify_result("ok", code=code)
+            if attempt in (1, 6, 16, 31):
+                snippet = re.sub(r"\s+", " ", content)[:180]
+                print(f"[!] {email} 邮件未能解析验证码，snippet: {snippet!r}")
+        else:
+            empty_streak += 1
+            if attempt % 5 == 1:
+                print(f"[*] {email} 等待验证邮件... (第 {attempt} 次)")
+            if cfg["empty_abort"] > 0 and empty_streak >= cfg["empty_abort"]:
+                print(f"[-] {email} 连续 {empty_streak} 次收件箱为空，提前放弃本轮")
+                return _verify_result("empty_inbox")
+
+        # 重发只在冷却（默认 120s）满足后做一次；提前重发会被站点 400 拒绝
+        if not resend_done and time.monotonic() >= resend_at:
+            resend_done = True
+            request_verification_mail(session, access_token, email, "仍未收到验证码，再次请求发信")
+
+    return _verify_result("timeout")
 
 
 def poll_verification_code(
@@ -775,47 +993,35 @@ def poll_verification_code(
     email_service_type: str,
     session=None,
     access_token: str | None = None,
-    max_rounds: int = 45,
-):
+    config: dict | None = None,
+) -> dict:
     """
-    Poll temp inbox for ProxyScrape verification code.
+    轮询临时邮箱获取 ProxyScrape 验证码。
 
-    After register, immediately request a code send (resend endpoint), then poll.
-    If still empty after ~20s, resend once more (respect 2-minute site limit).
+    参数:
+        email_service: 邮箱服务实例（Worker / GPTMail）。
+        jwt: Worker jwt；GPTMail 不使用。
+        email: 邮箱地址。
+        email_service_type: "gptmail" 或其它。
+        session: 站点会话；提供时先请求发信，并在冷却满足后重发一次。
+        access_token: 站点 access_token，配合 session 使用。
+        config: 覆盖 ``_verify_poll_config()``（测试注入用，避免真等 180s）。
+
+    返回:
+        ``{"code", "reason", "domain_blocked"}``，reason 取值：
+        - "ok"                 拿到验证码；
+        - "timeout"            窗口内始终无可解析验证码；
+        - "empty_inbox"        连续空收件箱达阈值，提前放弃；
+        - "unsupported_domain" 服务商不支持该域名，已加入黑名单（domain_blocked=True）；
+        - "stopped"            用户请求停止。
+
+    副作用: 网络请求、打印进度；reason=unsupported_domain 时写 ``.env`` 黑名单。
     """
-    if session is not None and access_token:
-        print(f"[*] {email} 请求发送邮箱验证码 (reset-verification-code)...")
-        rr = resend_verification_code(session, access_token)
-        print(f"[*] {email} 发信结果 ({rr['status']}): {rr['message']}")
-
-    last_raw_len = 0
-    for attempt in range(max_rounds):
-        if stop_flag:
-            return None
-        time.sleep(2 if attempt else 1)
-
-        content = fetch_inbox_content(email_service, jwt, email, email_service_type)
-        if content:
-            if len(content) != last_raw_len:
-                last_raw_len = len(content)
-                print(f"[*] {email} 收到邮件 (len={len(content)})，解析验证码...")
-            code = parse_verification_code(content)
-            if code:
-                return code
-            if attempt in (0, 5, 15, 30):
-                snippet = re.sub(r"\s+", " ", content)[:180]
-                print(f"[!] {email} 邮件未能解析验证码，snippet: {snippet!r}")
-        else:
-            if attempt % 5 == 0:
-                print(f"[*] {email} 等待验证邮件... ({attempt + 1}/{max_rounds})")
-
-        # Retry resend around attempt 12 if still no parseable code
-        if attempt == 12 and session is not None and access_token:
-            print(f"[*] {email} 仍未解析到验证码，再次请求发信...")
-            rr = resend_verification_code(session, access_token)
-            print(f"[*] {email} 再次发信 ({rr['status']}): {rr['message']}")
-
-    return None
+    cfg = config or _verify_poll_config()
+    request_verification_mail(session, access_token, email, "请求发送邮箱验证码")
+    return _poll_verification_loop(
+        email_service, jwt, email, email_service_type, cfg, session, access_token
+    )
 
 
 def register_accounts():
@@ -936,7 +1142,7 @@ def register_accounts():
                 # Register does NOT reliably auto-send mail; we call resend endpoint.
                 if not email_verified:
                     print(f"[*] {email} 开始邮箱验证流程...")
-                    code = poll_verification_code(
+                    vpoll = poll_verification_code(
                         email_service,
                         jwt,
                         email,
@@ -944,14 +1150,17 @@ def register_accounts():
                         session=session,
                         access_token=access_token,
                     )
+                    code = vpoll["code"]
                     if not code:
-                        print(
-                            f"[-] {email} 未解析到验证码；已保存未验证账号（不计入成功）"
+                        reason = _VERIFY_FAIL_TEXT.get(
+                            vpoll["reason"], "未解析到验证码"
                         )
+                        print(f"[-] {email} {reason}；已保存未验证账号（不计入成功）")
                         paths = save_account_credentials(
                             email, password, access_token, extra="UNVERIFIED"
                         )
                         print(f"[~] 未验证账号 -> {paths['accounts']}")
+                        # 域名不支持 / 收件箱长期为空 / 用户停止：本轮已无意义，直接换号
                         time.sleep(3)
                         continue
 

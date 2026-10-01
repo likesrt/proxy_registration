@@ -5,6 +5,7 @@
 """
 import os
 import random
+import re
 import string
 import threading
 import time
@@ -21,6 +22,9 @@ from .email_blacklist import (
 
 # generate-email 返回黑名单域名时的最大重试次数（用完抛 BlockedEmailRetriesExhausted）
 _BLOCKED_EMAIL_RETRIES = 5
+
+# 收件接口对「不服务」的域名返回 400 {"success":false,"error":"Unsupported email domain"}
+_UNSUPPORTED_DOMAIN_RE = re.compile(r"unsupported\s+email\s+domain", re.IGNORECASE)
 
 # 公开 key 接口：站点前端用「点击显示」按钮调用它拿到可用的 X-API-Key
 DEFAULT_PUBLIC_KEY_URL = "https://mail.chatgpt.org.uk/api/public-key-status?reveal=1"
@@ -85,6 +89,18 @@ def get_public_api_key(force: bool = False) -> Optional[str]:
             _public_key_cache["key"] = key
             _public_key_cache["fetched_at"] = time.time()
         return _public_key_cache.get("key")
+
+
+class UnsupportedEmailDomain(RuntimeError):
+    """
+    邮件服务商声明不支持该收件域名（GPTMail: HTTP 400 "Unsupported email domain"）。
+
+    这是**域名级、确定性**的失败：域名 MX 失效被停用后，重发验证码、继续轮询都不会有用。
+    调用方应把该域名加入黑名单并立即结束本轮，而不是把轮询窗口耗完。
+
+    与 ``BlockedEmailRetriesExhausted`` 的区别：那个是「抽到了黑名单域名」，
+    这个是「服务商明确拒绝服务该域名」。两者都是域名问题，但触发点不同。
+    """
 
 
 class GPTMailService:
@@ -241,7 +257,18 @@ class GPTMailService:
 
     def fetch_first_email(self, jwt_unused, email=None):
         """
-        获取邮箱的第一封邮件内容
+        获取邮箱的第一封邮件内容。
+
+        参数:
+            jwt_unused: 兼容 Cloudflare Worker 服务的签名，GPTMail 不使用。
+            email: 要读取的邮箱地址，必填；缺失时打印提示并返回 None。
+
+        返回:
+            第一封邮件的正文文本（无正文时再取单封详情）；收件箱为空返回 None。
+
+        异常:
+            UnsupportedEmailDomain: 服务商返回 400 "Unsupported email domain"（域名被停用）。
+                这是域名级硬失败，不在此吞掉——冒泡给调用方拉黑该域名并结束本轮。
         """
         if not email:
             print("[-] fetch_first_email 需要 email 参数")
@@ -267,9 +294,15 @@ class GPTMailService:
                     if email_id:
                         return self._fetch_email_detail(email_id)
                 return None
-            else:
-                print(f"[-] 获取邮件失败: {res.status_code} - {res.text}")
-                return None
+            if _UNSUPPORTED_DOMAIN_RE.search(res.text or ""):
+                # 域名级硬失败：不再按普通错误打印（否则 45 轮轮询会刷 45 行同样的日志）
+                raise UnsupportedEmailDomain(
+                    f"HTTP {res.status_code} {res.text[:120]}"
+                )
+            print(f"[-] 获取邮件失败: {res.status_code} - {res.text}")
+            return None
+        except UnsupportedEmailDomain:
+            raise
         except Exception as e:
             print(f"获取邮件失败: {e}")
             return None

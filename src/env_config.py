@@ -138,9 +138,44 @@ CONFIG_SCHEMA = [
             },
             {
                 "key": "MAX_CAPTCHA_FAIL_ROUNDS",
-                "label": "验证码失败轮数上限",
+                "label": "Turnstile 连续失败上限",
                 "type": "number",
                 "default": "3",
+                "help": (
+                    "人机验证（Turnstile）连续这么多个账号求解失败就停止注册，"
+                    "用于识别本地 solver 未启动；与下面的邮箱验证邮件轮询无关"
+                ),
+            },
+            {
+                "key": "VERIFY_POLL_WINDOW",
+                "label": "验证邮件轮询窗口(秒)",
+                "type": "number",
+                "default": "180",
+                "help": (
+                    "拉取验证邮件的总时长；站点限制验证码每 2 分钟只能重发一次，"
+                    "窗口下限自动取「重发延后 + 30 秒」，设更小无效"
+                ),
+            },
+            {
+                "key": "VERIFY_RESEND_AFTER",
+                "label": "重发验证码延后(秒)",
+                "type": "number",
+                "default": "120",
+                "help": "首次发信后多久重发；低于 120 会被站点拒绝（每 2 分钟一次），自动抬到 120",
+            },
+            {
+                "key": "VERIFY_EMPTY_ABORT_FETCHES",
+                "label": "空收件箱提前放弃次数",
+                "type": "number",
+                "default": "10",
+                "help": "连续这么多次取到空收件箱就提前结束本轮（约 20 秒），0 = 不提前放弃",
+            },
+            {
+                "key": "VERIFY_POLL_INTERVAL",
+                "label": "验证邮件取信间隔(秒)",
+                "type": "number",
+                "default": "2",
+                "help": "两次拉取收件箱之间的间隔，影响取信频率与 API 消耗，一般不用改",
             },
             {
                 "key": "PROXY",
