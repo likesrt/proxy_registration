@@ -52,11 +52,18 @@ from src.proxyscrape_helpers import (  # noqa: E402
 from src.env_config import (  # noqa: E402
     DEFAULT_ENV_PATH,
     CONFIG_SCHEMA,
+    ENV_FILE_LOCK,
     get_config_for_ui,
     upsert_env_file,
     apply_updates_to_environ,
     reload_main_module_config,
     all_config_keys,
+)
+from src.email_blacklist import (  # noqa: E402
+    ENV_KEY as BLACKLIST_KEY,
+    entries_text,
+    invalid_entries,
+    merge_entries_for_save,
 )
 import main as reg  # noqa: E402
 
@@ -1569,6 +1576,8 @@ CONFIG_HTML = r"""<!DOCTYPE html>
     let schema = [];
     let values = {};
     let secretsSet = {};
+    // 页面加载时 .env 里的黑名单快照：保存时用它判断注册线程有没有中途自动拉黑
+    let blacklistBase = "";
 
     async function api(path, opts) {
       const r = await fetch(path, opts);
@@ -1637,6 +1646,7 @@ CONFIG_HTML = r"""<!DOCTYPE html>
       schema = data.schema || [];
       values = data.values || {};
       secretsSet = data.secrets_set || {};
+      blacklistBase = values["EMAIL_BLACKLIST"] || "";
       $("envPath").textContent = (data.exists ? "文件: " : "将创建: ") + (data.env_path || ".env");
       renderForm();
       $("statusLine").textContent = "已加载配置（全部明文）。修改后点「保存到 .env」。";
@@ -1657,13 +1667,18 @@ CONFIG_HTML = r"""<!DOCTYPE html>
         const data = await api("/api/config", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ values: updates }),
+          body: JSON.stringify({ values: updates, blacklist_base: blacklistBase }),
         });
+        // 解析不了的域名会被丢弃：明确回显，否则用户会以为已经生效
+        const ignored = data.invalid_blacklist || [];
         $("statusLine").textContent =
           `已保存 ${ (data.updated || []).length } 项到 .env` +
+          (ignored.length
+            ? ` · 已忽略 ${ignored.length} 条无效黑名单项: ${ignored.join(" ")}`
+            : "") +
           (data.reloaded ? ` · 已热更新: ${data.reloaded.join(", ")}` : "") +
           (data.restart_hint ? ` · ${data.restart_hint}` : "");
-        $("statusLine").className = "status ok";
+        $("statusLine").className = ignored.length ? "status err" : "status ok";
         await loadConfig();
       } catch (e) {
         $("statusLine").textContent = e.message;
@@ -1727,6 +1742,10 @@ async def config_page():
 async def api_config_get():
     # Authenticated only (before_request). Return full plaintext values.
     data = get_config_for_ui(DEFAULT_ENV_PATH, include_secrets=True)
+    # 黑名单单独取：它会被注册线程直接写进 .env（不刷新进程环境），
+    # 而 get_config_for_ui 让 os.environ 覆盖文件，会把自动加入的条目藏起来，
+    # 导致页面上删不掉（=解封失效）。这里以文件为准，与 is_blocked 保持同源。
+    data["values"][BLACKLIST_KEY] = entries_text(DEFAULT_ENV_PATH)
     data["ok"] = True
     return jsonify(data)
 
@@ -1750,7 +1769,20 @@ async def api_config_save():
     if not updates:
         return jsonify({"ok": False, "error": "没有可保存的变更"}), 400
 
-    result = upsert_env_file(updates, path=DEFAULT_ENV_PATH, keys_allowlist=list(allow))
+    # 黑名单会在注册过程中被后台线程自动追加：如果页面的初始值和磁盘不一致，
+    # 说明期间有新条目进来自动拉黑，合并而不是直接覆盖（用户删掉的行仍然生效）。
+    ignored_entries = []
+    with ENV_FILE_LOCK:
+        if BLACKLIST_KEY in updates:
+            ignored_entries = invalid_entries(updates[BLACKLIST_KEY])
+            updates[BLACKLIST_KEY] = merge_entries_for_save(
+                updates[BLACKLIST_KEY],
+                body.get("blacklist_base"),
+                path=DEFAULT_ENV_PATH,
+            )
+        result = upsert_env_file(
+            updates, path=DEFAULT_ENV_PATH, keys_allowlist=list(allow)
+        )
     apply_updates_to_environ(updates)
     reloaded = reload_main_module_config(reg)
     # Wake the scheduler so AUTO_REGISTER_* changes apply now instead of after a
@@ -1767,6 +1799,8 @@ async def api_config_save():
             "updated": result.get("updated") or list(updates.keys()),
             "path": result.get("path"),
             "created": result.get("created"),
+            # 无法解析成域名的黑名单条目会被丢弃：回显给页面，避免"填了却没生效"
+            "invalid_blacklist": ignored_entries,
             "reloaded": reloaded,
             "restart_hint": restart_hint,
         }

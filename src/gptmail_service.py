@@ -13,6 +13,15 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+from .email_blacklist import (
+    AllDomainsBlacklisted,
+    BlockedEmailRetriesExhausted,
+    is_blocked,
+)
+
+# generate-email 返回黑名单域名时的最大重试次数（用完抛 BlockedEmailRetriesExhausted）
+_BLOCKED_EMAIL_RETRIES = 5
+
 # 公开 key 接口：站点前端用「点击显示」按钮调用它拿到可用的 X-API-Key
 DEFAULT_PUBLIC_KEY_URL = "https://mail.chatgpt.org.uk/api/public-key-status?reveal=1"
 _PUBLIC_KEY_TTL = 3600
@@ -108,13 +117,22 @@ class GPTMailService:
         )
         self.timeout = timeout
 
-    def _next_domain(self) -> str:
-        """轮换选择下一个邮箱域名后缀"""
-        domain = self.email_domains[
-            GPTMailService._domain_index % len(self.email_domains)
-        ]
-        GPTMailService._domain_index += 1
-        return domain
+    def _next_domain(self):
+        """
+        轮换选择下一个邮箱域名后缀，跳过黑名单（每次重读 .env，运行期新增立即生效）。
+
+        全部域名都被拉黑时返回 None。
+        """
+        domains = self.email_domains
+        if not domains:
+            return None
+        count = len(domains)
+        for _ in range(count):
+            domain = domains[GPTMailService._domain_index % count]
+            GPTMailService._domain_index += 1
+            if not is_blocked(domain):
+                return domain
+        return None
 
     def _update_usage(self, data: dict):
         """从接口 JSON 中缓存 usage（含 remaining_total 等）"""
@@ -160,14 +178,47 @@ class GPTMailService:
         """
         if self.email_domains:
             domain = self._next_domain()
+            if not domain:
+                raise AllDomainsBlacklisted(
+                    "所有 GPTMail 域名均已在黑名单: "
+                    + ", ".join(self.email_domains)
+                    + "（可在 Web 配置页「邮箱黑名单」里移除）"
+                )
             prefix = self._generate_random_name()
             email = f"{prefix}@{domain}"
             return None, email
         return self._generate_email_via_api()
 
     def _generate_email_via_api(self):
-        """调用 generate-email 接口随机生成临时邮箱"""
+        """
+        调用 generate-email 接口随机生成临时邮箱（命中黑名单则丢弃重试）。
+
+        返回:
+            ``(None, email)``；接口失败或返回体没有邮箱时返回 ``(None, None)``。
+
+        异常:
+            连续 ``_BLOCKED_EMAIL_RETRIES`` 次都拿到黑名单域名时抛
+            ``BlockedEmailRetriesExhausted`` —— 域名是服务端随机给的，
+            这只说明本轮运气差，调用方应换一轮重试，而不是直接判定池子不可用。
+        """
         url = f"{self.BASE_URL}/api/generate-email"
+        for attempt in range(_BLOCKED_EMAIL_RETRIES):
+            email = self._generate_email_once(url)
+            if not email:
+                return None, None
+            if not is_blocked(email):
+                return None, email
+            print(
+                f"[!] {email} 域名在黑名单，丢弃重试 "
+                f"({attempt + 1}/{_BLOCKED_EMAIL_RETRIES})..."
+            )
+        raise BlockedEmailRetriesExhausted(
+            f"GPTMail 连续 {_BLOCKED_EMAIL_RETRIES} 次只分配到黑名单域名"
+            "（可在 Web 配置页「邮箱黑名单」里移除）"
+        )
+
+    def _generate_email_once(self, url):
+        """单次调用 generate-email，失败返回 None（保持原有日志行为）"""
         try:
             res = requests.get(
                 url,
@@ -181,13 +232,12 @@ class GPTMailService:
                 data = res.json()
                 self._update_usage(data)
                 if data.get("success") and data.get("data"):
-                    email = data["data"].get("email")
-                    return None, email
+                    return data["data"].get("email")
             print(f"[-] 创建邮箱失败: {res.status_code} - {res.text}")
-            return None, None
+            return None
         except Exception as e:
             print(f"[-] 创建邮箱网络异常 ({url}): {e}")
-            return None, None
+            return None
 
     def fetch_first_email(self, jwt_unused, email=None):
         """

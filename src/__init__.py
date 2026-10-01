@@ -4,6 +4,18 @@ ProxyScrape 注册机配件
 from .email_service import EmailService
 from .turnstile_service import TurnstileService
 from .gptmail_service import GPTMailService
+from .email_blacklist import (
+    AllDomainsBlacklisted,
+    BlockedEmailRetriesExhausted,
+    auto_block_enabled,
+    block_domain,
+    entries_text,
+    invalid_entries,
+    is_blocked,
+    load_blocked_entries,
+    psl_available,
+    registrable_domain,
+)
 from .proxyscrape_helpers import (
     SIGNUP_URL,
     LOGIN_URL,
@@ -45,6 +57,16 @@ __all__ = [
     "EmailService",
     "TurnstileService",
     "GPTMailService",
+    "AllDomainsBlacklisted",
+    "BlockedEmailRetriesExhausted",
+    "auto_block_enabled",
+    "block_domain",
+    "entries_text",
+    "invalid_entries",
+    "is_blocked",
+    "load_blocked_entries",
+    "psl_available",
+    "registrable_domain",
     "SIGNUP_URL",
     "LOGIN_URL",
     "REGISTER_ENDPOINT",

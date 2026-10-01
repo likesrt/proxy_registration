@@ -23,7 +23,7 @@ http://s04xvtwkxqsv:3f0gsnlwbbsonwm@209.50.163.168:3129
 | 1. 注册 | `POST /v2/v4/account/auth/register`（需 Turnstile） |
 | 2. 邮箱验证 | 拉取临时邮箱验证码 → `verify-email` |
 | 3. 问卷 | 完成 `/v2/typeform` 引导（API 提交，无需手动点页面） |
-| 4. 激活试用 | 确认 `/me` 的 `typeform=false` 后，`POST /v2/v4/account/premium/claim-trial` |
+| 4. 激活试用 | 确认 `/me` 的 `typeform=false` 后，`POST /v2/v4/account/premium/claim-trial`；返回 `not eligible for the free trial` 时自动把该邮箱的根域加入 `EMAIL_BLACKLIST`（见「邮箱黑名单」） |
 | 5. 下载代理 | 拉取 `/v2/services/premium/proxy-list/{accountId}` 对应列表 |
 | 6. 记录到期 | 用上一步已拿到的 overview 顺手缓存到期时间（`keys/account_details_cache.json`，零额外请求） |
 | 7. 代理 Feed | 远程订阅反向拉取 `GET /api/feed/proxies`（只读本地 per-account 文件，无网络请求） |
@@ -248,6 +248,44 @@ AUTO_REGISTER_MAX_PER_ROUND=20 # 单轮最多注册数量
 - **连续失败退避**：一轮结束后可供给账号数没有增加（典型原因：本地 Turnstile Solver 未启动，`register_accounts` 会立刻返回）时，下轮等待时间翻倍，最多 `6 × AUTO_REGISTER_INTERVAL`；一旦数量增加就复位；
 - **仅支持单进程运行**：调度器是 `web_app.py` 内的 daemon 线程。不要用 gunicorn/uvicorn 多 worker 启动本进程，否则会起多个调度器共享同一份 `keys/` 而并发写坏文件。
 
+### 6. 邮箱黑名单（自动，一次即封）
+
+有些临时邮箱后缀拿不到免费试用：站点返回
+
+```text
+400 This email address is not eligible for the free trial.
+```
+
+出现这句时，程序会把该邮箱的**可注册根域**写进 `.env` 的 `EMAIL_BLACKLIST`（一次即封），之后选邮箱时自动跳过该后缀：
+
+```text
+[-] lmorgan370@ricardo0911.xyz 免费试用激活失败 (400): This email address is not eligible for the free trial.
+[!] lmorgan370@ricardo0911.xyz 域名已加入黑名单: ricardo0911.xyz（该后缀不再使用，可在 Web 配置页移除）
+```
+
+```env
+EMAIL_BLACKLIST_AUTO=true          # false = 只用手工名单，不自动拉黑
+EMAIL_BLACKLIST=ricardo0911.xyz,corbyrise.com
+```
+
+规则：
+
+- **只认这一句文案**：401 / 429 / 5xx 之类的瞬时失败不会拉黑整个后缀；
+- **一次即封，配置里的域名同样会被烧掉**：`EMAIL_DOMAIN` / `GPTMAIL_DOMAIN` 里的域名命中这句后照样写进黑名单，从轮换中移除，**不会再被使用**（轮换只剩其余域名），直到在配置页手工解封或关掉 `EMAIL_BLACKLIST_AUTO`；这是刻意的取舍——宁可烧掉一个后缀，也不继续往同一个废后缀上浪费账号；
+- **烧的是根域**：取可注册根域（eTLD+1，PSL），`alawson720@e.m.a.il.corbyrise.com` → 记 `corbyrise.com`，所以换子域也拦得住；也正因为如此，配置里若放了同一根域的多个子域（`mail.corbyrise.com` + `other.corbyrise.com`），一次命中会让它们**同时**失效；
+- **公共后缀不会被自动加入**：`eu.org` / `co.uk` / `github.io` 这类被 PSL 视为后缀的域名会被拒绝并打日志（`拒绝加入黑名单（避免误伤同后缀用户）`），所以 `a.eu.org` 只会记成 `a.eu.org`，不会把整个 `eu.org` 封掉；
+- **匹配是双向的**：名单里的父域拦住其所有子域；手工填子域（如 `mail.example.com`）会连 `example.com` 及其所有子域一起封掉——想让「换前缀 / 换子域」绕不过去就必须这样，填之前注意影响范围；
+- 邮件地址来自服务端随机分配时（`GPTMAIL_DOMAIN` 为空），命中黑名单会丢弃重试（最多 5 次）；连续 5 轮都只抽到黑名单域名才停止注册，避免单轮运气差就整任务判死；
+- **确定性的全封会立刻停下**：`EMAIL_DOMAIN` / `GPTMAIL_DOMAIN` 里配置的域名全部被拉黑时，注册直接停并打印原因，而不是空转重试；
+- 填了但解析不出域名的条目（如 `*.foo.com`、裸 TLD、URL）会被丢弃，保存时页面状态栏会回显"已忽略 N 条无效黑名单项"，不会静默吞掉；
+- 依赖 `tldextract`（已加入 `requirements.txt`，离线使用自带 PSL 快照）；若没装，则退化为「原样记录完整域名」——只拦精确域名，不会误伤，但拦不住同根域的其他子域。
+
+**读取优先级**：黑名单与 `EMAIL_BLACKLIST_AUTO` 都是「`.env` 文件优先，文件里没有该键时才回退进程环境变量」。因此注册过程中自动加入的条目立刻生效，Web 配置页显示的也就是真正生效的名单；手工编辑 `.env` 后无需重启。
+
+**Web 管理**：配置页新增「邮箱黑名单」一栏——`EMAIL_BLACKLIST` 每行（或逗号）一个域名，直接改、保存即生效；删掉某行再保存就是解封。注册过程中后台线程自动追加的条目不会被页面上的旧值覆盖（保存时会自动合并）。
+
+> 已注册成功的账号不受影响：黑名单只作用于**新建邮箱**。
+
 ---
 
 ## 使用方法
@@ -398,6 +436,7 @@ ProxyScrape/
 │   └── ...
 ├── src/
 │   ├── email_service.py
+│   ├── email_blacklist.py  # 邮箱域名黑名单（PSL 根域、公共后缀保护、.env 读写）
 │   ├── gptmail_service.py
 │   ├── turnstile_service.py
 │   └── proxyscrape_helpers.py
@@ -407,6 +446,7 @@ ProxyScrape/
     ├── test_account_web_helpers.py
     ├── test_env_config.py
     ├── test_feed_and_auto_register.py
+    ├── test_email_blacklist.py
     └── test_gptmail_service.py
 ```
 
@@ -465,6 +505,14 @@ python -m unittest discover -s tests -v
 
 - `unknown`（从未刷新过详情 / overview 失败）按规则算有效，因此既会进 feed，也**不会**被「删除过期账号」清掉——这是「未知算有效」+「只删 expired」两条规则的必然结果
 - 需要清掉就用「删除过期账号」并选择 `include_unknown`，或单独删除该账号
+
+### 邮箱域名被自动拉黑了 / 想重新启用某个后缀
+
+- 配置页「邮箱黑名单」里删掉那一行再保存即可解封（`.env` 的 `EMAIL_BLACKLIST`，逗号分隔）
+- 不想自动拉黑就把 `EMAIL_BLACKLIST_AUTO` 设为 `false`（手工名单仍然生效）；这两个值都是 `.env` 文件优先，改完保存即生效，无需重启
+- 自动拉黑**只认** `not eligible for the free trial` 这句；其它失败（超时、限流、401）不会动名单
+- 若日志出现「域名为公共后缀 … 拒绝加入黑名单」，说明该邮箱域名本身就是公共后缀（如 `eu.org`），程序故意不封，避免误伤同后缀的其他用户
+- 若日志出现「GPTMail 连续 5 次只分配到黑名单域名（连续 n/5 轮）」，说明服务端随机分配（`GPTMAIL_DOMAIN` 为空）连续抽到黑名单域名：程序会先重试，连续 5 轮都如此才停止注册；把黑名单里相关的后缀解封、或给 `GPTMAIL_DOMAIN` 配一批可用域名即可恢复
 
 ### 密码不符合站点规则
 

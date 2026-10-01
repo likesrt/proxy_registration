@@ -6,3 +6,4 @@ curl_cffi
 requests
 beautifulsoup4
 python-dotenv
+tldextract

@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from typing import Any, Optional
 
 # Project root .env (relative to cwd when running web_app/main)
 DEFAULT_ENV_PATH = ".env"
+
+# Serializes .env read-modify-write between the config page and background
+# threads (registration auto-blacklist appends domains while a run is active).
+ENV_FILE_LOCK = threading.RLock()
 
 # Fields editable from Web UI (covers project .env)
 # secret=True: 标记敏感配置（登录鉴权后配置页仍以明文展示，便于核对）
@@ -75,6 +80,35 @@ CONFIG_SCHEMA = [
                 "label": "公开 Key 接口",
                 "type": "text",
                 "default": "https://mail.chatgpt.org.uk/api/public-key-status?reveal=1",
+            },
+        ],
+    },
+    {
+        "group": "邮箱黑名单",
+        "keys": [
+            {
+                "key": "EMAIL_BLACKLIST_AUTO",
+                "label": "自动加入黑名单",
+                "type": "select",
+                "options": ["true", "false"],
+                "default": "true",
+                "help": (
+                    "免费试用返回 not eligible 时，自动把该邮箱的可注册根域加入黑名单"
+                    "（一次即封；已注册成功的账号不受影响）"
+                ),
+            },
+            {
+                "key": "EMAIL_BLACKLIST",
+                "label": "黑名单域名",
+                "type": "textarea",
+                "default": "",
+                "help": (
+                    "每行或逗号分隔；自动加入的是可注册根域，"
+                    "corbyrise.com 可拦住 e.m.a.il.corbyrise.com。"
+                    "注意匹配是双向的：填了 mail.example.com 会连 example.com "
+                    "及其所有子域一起封掉。"
+                    "公共后缀 eu.org / co.uk 不会被自动加入；删掉某行并保存即解封"
+                ),
             },
         ],
     },
@@ -280,15 +314,64 @@ def _format_env_value(value: str) -> str:
     return s
 
 
+# 列表型配置项：值必须是单行。.env 是行式存储，含换行的值会被 _format_env_value
+# 加引号后整体写出，但在下一行被截断，读回来无法还原（还会污染后面的键）。
+# 这里只做「空白 / 逗号 / 分号 → 单行逗号」的压平与去空项；
+# 域名的合法性校验与去重由 src/email_blacklist.py 负责。
+_LIST_VALUE_KEYS = {"EMAIL_BLACKLIST"}
+
+
+def _flatten_list_value(value) -> str:
+    """把列表型配置压成单行逗号分隔文本（丢弃空项，不校验元素是否合法）。"""
+    return ",".join(t for t in re.split(r"[\s,;]+", str(value or "")) if t)
+
+
 def upsert_env_file(
     updates: dict,
     path: str = DEFAULT_ENV_PATH,
     keys_allowlist: Optional[list] = None,
 ) -> dict:
     """
-    Update keys in .env file. Preserves comments and other keys.
-    Empty string values are written as KEY=
-    Returns {path, updated: [keys], created: bool}
+    写入 ``.env`` 的线程安全入口：用 ``ENV_FILE_LOCK`` 串行化「读-改-写」。
+
+    参数:
+        updates: {键: 值}，值为 None 的键跳过。
+        path: ``.env`` 路径。
+        keys_allowlist: 允许写入的键；None 时用 ``all_config_keys()``。
+
+    返回:
+        ``{"path", "updated": [键], "created": bool}``（透传内部实现）。
+
+    加锁原因: 注册线程自动追加黑名单与 Web 配置页保存可能同时改同一个文件，
+    未加锁的并发「读-改-写」会互相覆盖（丢条目）。锁可重入，
+    因此持有者内部再调用本函数（如 ``block_domain``）不会自锁。
+    """
+    with ENV_FILE_LOCK:
+        return _upsert_env_file_unlocked(updates, path, keys_allowlist)
+
+
+def _upsert_env_file_unlocked(
+    updates: dict,
+    path: str = DEFAULT_ENV_PATH,
+    keys_allowlist: Optional[list] = None,
+) -> dict:
+    """
+    真正执行 ``.env`` 读-改-写的内部实现（调用方必须已持有 ``ENV_FILE_LOCK``）。
+
+    参数:
+        updates: {键: 值}；键不在 ``keys_allowlist`` 内、或值为 None 时跳过。
+        path: ``.env`` 路径，不存在时创建。
+        keys_allowlist: 允许写入的键；None 时用 ``all_config_keys()``。
+
+    返回:
+        ``{"path", "updated": [键], "created": bool}``。
+
+    边界条件:
+        保留原有注释与未涉及的键；空字符串值写成 ``KEY=``（而不是删除该行）；
+        缺失的键追加到文件末尾；列表型键（见 ``_LIST_VALUE_KEYS``）先压成单行。
+
+    副作用:
+        整体重写文件（末尾补换行）并可能创建父目录；不修改 ``os.environ``。
     """
     allow = set(keys_allowlist or all_config_keys())
     clean = {}
@@ -297,7 +380,10 @@ def upsert_env_file(
             continue
         if v is None:
             continue
-        clean[str(k)] = str(v)
+        # 列表型配置压成单行，避免多行值把 .env 写坏（见 _LIST_VALUE_KEYS 注释）
+        clean[str(k)] = (
+            _flatten_list_value(v) if str(k) in _LIST_VALUE_KEYS else str(v)
+        )
 
     created = not os.path.isfile(path)
     lines: list = []

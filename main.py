@@ -20,6 +20,10 @@ from src import (
     EmailService,
     GPTMailService,
     TurnstileService,
+    AllDomainsBlacklisted,
+    BlockedEmailRetriesExhausted,
+    auto_block_enabled,
+    block_domain,
 )
 from src.proxyscrape_helpers import (
     SIGNUP_URL,
@@ -663,6 +667,97 @@ def claim_premium_trial(session, access_token: str) -> dict:
     }
 
 
+# 站点只在邮箱域名不可用时返回这句；这是唯一可靠的「该后缀已废」信号
+TRIAL_INELIGIBLE_RE = re.compile(
+    r"not\s+eligible\s+for\s+(?:the\s+)?(?:free\s+)?trial", re.IGNORECASE
+)
+
+
+def is_trial_ineligible(message) -> bool:
+    """免费试用失败信息是否表示该邮箱地址不具备试用资格。"""
+    return bool(TRIAL_INELIGIBLE_RE.search(str(message or "")))
+
+
+def blacklist_trial_domain(email: str, message) -> dict:
+    """
+    试用失败且文案确认是「地址无资格」时，把该邮箱的域名加入黑名单（一次即封）。
+
+    只有站点明确返回 not eligible for the free trial 才触发；
+    401/429/5xx 之类的瞬时失败不会拉黑整个后缀。
+    """
+    if not is_trial_ineligible(message):
+        return {"ok": False, "added": False, "entry": "", "error": "not_ineligible"}
+    if not auto_block_enabled():
+        print("[*] 邮箱黑名单自动加入已关闭（EMAIL_BLACKLIST_AUTO=false），跳过")
+        return {"ok": False, "added": False, "entry": "", "error": "disabled"}
+
+    result = block_domain(email)
+    if result.get("added"):
+        print(
+            f"[!] {email} 域名已加入黑名单: {result['entry']}"
+            "（该后缀不再使用，可在 Web 配置页移除）"
+        )
+    elif result.get("ok"):
+        print(f"[*] {email} 域名 {result['entry']} 已在黑名单中")
+    elif result.get("error") == "public_suffix":
+        print(
+            f"[!] {email} 域名为公共后缀 {result.get('entry')}，"
+            "拒绝加入黑名单（避免误伤同后缀用户）"
+        )
+    else:
+        print(f"[!] {email} 域名无法加入黑名单: {result.get('error')}")
+    return result
+
+
+# 服务端随机分配域名时（GPTMAIL_DOMAIN 为空），单轮命中的只是「这次抽到的域名」，
+# 换个时间可能抽到别的域名；连续这么多轮都只抽到黑名单域名，才判定整个池子不可用。
+MAX_BLOCKED_EMAIL_ROUNDS = 5
+
+
+def acquire_email(email_service, blocked_rounds: int = 0) -> dict:
+    """
+    创建临时邮箱，并把「黑名单」类失败翻译成注册循环的控制动作。
+
+    参数:
+        email_service: EmailService / GPTMailService 实例。
+        blocked_rounds: 之前连续「服务端只给出黑名单域名」的轮数，用于判断是否放弃。
+
+    返回:
+        ``{"action", "jwt", "email", "blocked_rounds"}``，action 取值：
+        - ``"ok"``    ：拿到可用邮箱，jwt/email 有效；
+        - ``"retry"`` ：本轮拿不到邮箱（邮箱服务异常 / 返回空 / 服务端连续给黑名单域名），
+                        调用方 sleep 后进下一轮；
+        - ``"stop"``  ：配置里的域名全被拉黑，或服务端连续 ``MAX_BLOCKED_EMAIL_ROUNDS``
+                        轮只给黑名单域名，调用方应结束注册（继续跑只会空转）。
+
+    副作用: 打印失败原因；不修改 ``blocked_rounds`` 之外的状态。
+    """
+    try:
+        jwt, email = email_service.create_email()
+    except BlockedEmailRetriesExhausted as e:
+        # 随机分配的域名：换一轮可能抽到别的域名，先重试而不是立刻判死
+        blocked_rounds += 1
+        print(f"[-] {e}（连续 {blocked_rounds}/{MAX_BLOCKED_EMAIL_ROUNDS} 轮）")
+        action = "stop" if blocked_rounds >= MAX_BLOCKED_EMAIL_ROUNDS else "retry"
+        return {"action": action, "jwt": None, "email": None,
+                "blocked_rounds": blocked_rounds}
+    except AllDomainsBlacklisted as e:
+        # 配置里的域名列表是确定性的：全被拉黑就再也拿不到邮箱
+        print(f"[-] {e}")
+        return {"action": "stop", "jwt": None, "email": None,
+                "blocked_rounds": blocked_rounds}
+    except Exception as e:
+        print(f"[-] 邮箱服务抛出异常: {e}")
+        return {"action": "retry", "jwt": None, "email": None,
+                "blocked_rounds": blocked_rounds}
+
+    if not email:
+        print("[-] 邮箱创建返回空，可能接口挂了或超时")
+        return {"action": "retry", "jwt": None, "email": None,
+                "blocked_rounds": blocked_rounds}
+    return {"action": "ok", "jwt": jwt, "email": email, "blocked_rounds": 0}
+
+
 def fetch_inbox_content(email_service, jwt, email: str, email_service_type: str):
     try:
         if email_service_type == "gptmail":
@@ -744,6 +839,8 @@ def register_accounts():
 
     consecutive_captcha_fails = 0
     max_captcha_rounds = int(os.getenv("MAX_CAPTCHA_FAIL_ROUNDS", "3") or "3")
+    # 连续「服务端只给黑名单域名」的轮数，见 acquire_email
+    blocked_email_rounds = 0
 
     while not stop_flag and success_count < target_count:
         try:
@@ -755,14 +852,17 @@ def register_accounts():
 
                 password = get_register_password()
 
-                try:
-                    jwt, email = email_service.create_email()
-                except Exception as e:
-                    print(f"[-] 邮箱服务抛出异常: {e}")
-                    jwt, email = None, None
-
-                if not email:
-                    print("[-] 邮箱创建返回空，可能接口挂了或超时，等待 5s...")
+                acq = acquire_email(email_service, blocked_email_rounds)
+                blocked_email_rounds = acq["blocked_rounds"]
+                if acq["action"] == "stop":
+                    print(
+                        "[-] 没有可用邮箱域名，停止注册"
+                        "（可在 Web 配置页「邮箱黑名单」检查或解封）"
+                    )
+                    return
+                jwt, email = acq["jwt"], acq["email"]
+                if acq["action"] != "ok":
+                    print("[-] 本轮未拿到可用邮箱，等待 5s 后重试...")
                     time.sleep(5)
                     continue
 
@@ -929,6 +1029,7 @@ def register_accounts():
                         f"[-] {email} 免费试用激活失败 ({cres['status']}): "
                         f"{cres['message']}"
                     )
+                    blacklist_trial_domain(email, cres.get("message"))
                     paths = save_account_credentials(
                         email, password, access_token, extra="NO_PREMIUM_TRIAL"
                     )

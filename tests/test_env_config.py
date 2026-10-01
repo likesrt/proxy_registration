@@ -42,6 +42,23 @@ class TestEnvConfig(unittest.TestCase):
             self.assertEqual(vals["BAR"], "new")
             self.assertEqual(vals["BAZ"], "x")
 
+    def test_multiline_list_value_is_flattened(self):
+        """列表型配置必须单行写入：含换行的值会被引号整体写出并在下一行截断。"""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, ".env")
+            upsert_env_file(
+                {"EMAIL_BLACKLIST": "a.com\n b.com,  c.com\n"},
+                path=path,
+                keys_allowlist=["EMAIL_BLACKLIST"],
+            )
+            text = open(path, encoding="utf-8").read()
+            self.assertEqual(parse_env_file(path)["EMAIL_BLACKLIST"],
+                             "a.com,b.com,c.com")
+            self.assertEqual(
+                [l for l in text.splitlines() if l.startswith("EMAIL_BLACKLIST")],
+                ["EMAIL_BLACKLIST=a.com,b.com,c.com"],
+            )
+
     def test_schema_has_core_keys(self):
         keys = set(all_config_keys())
         for k in (

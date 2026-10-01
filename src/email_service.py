@@ -7,6 +7,8 @@ import random
 import string
 from dotenv import load_dotenv
 
+from .email_blacklist import AllDomainsBlacklisted, is_blocked
+
 
 class EmailService:
     """邮箱服务类"""
@@ -33,13 +35,22 @@ class EmailService:
                 "Missing required environment variables: WORKER_DOMAIN, EMAIL_DOMAIN, ADMIN_PASSWORD"
             )
 
-    def _next_domain(self) -> str:
-        """轮换选择下一个邮箱域名后缀"""
-        domain = self.email_domains[
-            EmailService._domain_index % len(self.email_domains)
-        ]
-        EmailService._domain_index += 1
-        return domain
+    def _next_domain(self):
+        """
+        轮换选择下一个邮箱域名后缀，跳过黑名单（每次重读 .env，运行期新增立即生效）。
+
+        全部域名都被拉黑时返回 None。
+        """
+        domains = self.email_domains
+        if not domains:
+            return None
+        count = len(domains)
+        for _ in range(count):
+            domain = domains[EmailService._domain_index % count]
+            EmailService._domain_index += 1
+            if not is_blocked(domain):
+                return domain
+        return None
 
     def _generate_random_name(self):
         """生成随机邮箱名称"""
@@ -54,10 +65,16 @@ class EmailService:
 
     def create_email(self):
         """
-        创建临时邮箱（域名后缀在配置列表中轮换选择）
+        创建临时邮箱（域名后缀在配置列表中轮换选择，自动跳过黑名单）
         """
         url = f"https://{self.worker_domain}/admin/new_address"
         domain = self._next_domain()
+        if not domain:
+            raise AllDomainsBlacklisted(
+                "所有邮箱域名均已在黑名单: "
+                + ", ".join(self.email_domains)
+                + "（可在 Web 配置页「邮箱黑名单」里移除）"
+            )
         try:
             random_name = self._generate_random_name()
             res = requests.post(
