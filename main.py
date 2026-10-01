@@ -820,19 +820,72 @@ def fetch_inbox_content(email_service, jwt, email: str, email_service_type: str)
         return None
 
 
+def fetch_inbox_contents(email_service, jwt, email: str, email_service_type: str):
+    """
+    拉取临时邮箱内全部邮件的正文（最新在前），供"换一个验证码重试"使用。
+
+    参数:
+        email_service: EmailService / GPTMailService 实例。
+        jwt: Cloudflare Worker 服务的 jwt；GPTMail 不使用。
+        email: 邮箱地址（GPTMail 必需）。
+        email_service_type: "gptmail" 走 GPTMail；其它服务没有列表接口，返回空。
+
+    返回:
+        正文列表，最新在前；不支持或异常时返回空列表。
+
+    说明: 这是尽力而为的兜底路径，任何异常都不向外抛——调用点此时已经拿到一个
+    验证码，不该因为兜底查询失败而中断注册流程。
+    """
+    fetch_all = getattr(email_service, "fetch_inbox_contents", None)
+    if email_service_type != "gptmail" or fetch_all is None:
+        return []
+    try:
+        return fetch_all(email=email) or []
+    except Exception as e:
+        print(f"[-] 拉取邮件列表失败: {e}")
+        return []
+
+
+def _other_verification_codes(
+    email_service, jwt, email: str, email_service_type: str, tried: str
+) -> list:
+    """
+    收集邮箱内除 ``tried`` 之外的其他验证码，最新在前且去重。
+
+    背景: 重发验证码后箱内可能同时存在新旧两封邮件，站点会作废旧码。取信拿到的是
+    最新那封，但仍保留这道兜底——先试的码若不通，还有机会用别的码完成验证，
+    而不是直接把这个账号记成 UNVERIFIED。
+
+    参数:
+        tried: 已经尝试过的验证码，会从结果中排除。
+
+    返回:
+        候选验证码列表；没有其他码或拉取失败时为空列表。
+    """
+    codes = []
+    for content in fetch_inbox_contents(email_service, jwt, email, email_service_type):
+        code = parse_verification_code(content)
+        if code and code != tried and code not in codes:
+            codes.append(code)
+    return codes
+
+
 # 邮箱验证轮询默认参数（可用环境变量覆盖，配置页可直接改）
 # 站点限制验证码每 2 分钟只能重发一次，所以窗口必须留出"重发之后还能收信"的余量，
 # 否则重发等于白做（旧实现窗口仅 ~89s，重发必然撞 400，已修正）。
+# 窗口取 240s 而非 180s：重发在 120s，重发那封仍需要投递时间，240s 给足 120s；
+# 实测（2026-10）邮件延迟超过 76s，180s 窗口下重发那封几乎必然落在窗口之外。
+# 放弃本轮只由窗口（时间）决定：空收件箱既可能是坏域名、也可能只是投递慢，
+# 二者无法区分，所以不再用"连续空箱 N 次"提前放弃——它会把慢到的邮件连同账号一起丢掉。
+# 真正失效的域名由取信接口的 HTTP 400 Unsupported email domain 确定性判定，
+# 见 blacklist_unsupported_domain。
 _VERIFY_DEFAULT_INTERVAL = 2.0
-_VERIFY_DEFAULT_WINDOW = 180.0
+_VERIFY_DEFAULT_WINDOW = 240.0
 _VERIFY_DEFAULT_RESEND_AFTER = 120.0
-# 连续空收件箱 10 次（约 20s）即换号：兼顾"邮件延迟几十秒"与"坏域名别白等"
-_VERIFY_DEFAULT_EMPTY_ABORT = 10
 
 # 失败原因 → 日志文案（供注册主循环复用）
 _VERIFY_FAIL_TEXT = {
-    "timeout": "轮询窗口内未解析到验证码",
-    "empty_inbox": "收件箱持续为空，提前放弃本轮",
+    "timeout": "轮询窗口内未收到验证码",
     "unsupported_domain": "邮件服务商不支持该收件域名（已拉黑）",
     "stopped": "用户请求停止",
 }
@@ -864,11 +917,12 @@ def _verify_poll_config() -> dict:
     组装验证码轮询参数（每次轮询都重读，配置页改完即生效）。
 
     返回:
-        ``{"interval", "window", "resend_after", "empty_abort"}``：
+        ``{"interval", "window", "resend_after"}``：
         - interval: 取信间隔（秒），下限 1；
         - resend_after: 首次发信后多久重发，下限 120（站点冷却要求）；
-        - window: 整个轮询窗口（秒），下限 ``resend_after + 30``，保证重发后还有收信时间；
-        - empty_abort: 连续取到空收件箱多少次放弃本轮，<=0 表示不启用该提前退出。
+        - window: 整个轮询窗口（秒），下限 ``resend_after + 30``，保证重发后还有收信时间。
+
+    说明: 不再提供"空箱提前放弃"参数——放弃只由 window 决定，理由见上方默认值注释。
     """
     interval = max(
         1.0, _verify_env_number("VERIFY_POLL_INTERVAL", _VERIFY_DEFAULT_INTERVAL)
@@ -880,14 +934,10 @@ def _verify_poll_config() -> dict:
         resend_after + 30.0,
         _verify_env_number("VERIFY_POLL_WINDOW", _VERIFY_DEFAULT_WINDOW),
     )
-    empty_abort = int(
-        _verify_env_number("VERIFY_EMPTY_ABORT_FETCHES", _VERIFY_DEFAULT_EMPTY_ABORT)
-    )
     return {
         "interval": interval,
         "window": window,
         "resend_after": resend_after,
-        "empty_abort": empty_abort,
     }
 
 
@@ -932,8 +982,10 @@ def _poll_verification_loop(
         session / access_token: 站点会话与令牌，用于冷却满足后重发。
 
     返回:
-        ``_verify_result(...)``；reason 为 ok / timeout / empty_inbox /
-        unsupported_domain / stopped。
+        ``_verify_result(...)``；reason 为 ok / timeout / unsupported_domain / stopped。
+
+    说明: 空收件箱不构成放弃条件（可能只是投递慢），只累计等待直到窗口耗尽，
+    因此这里不再有 empty_inbox 这一路提前退出。
 
     副作用: 网络取信、按需重发、打印进度；unsupported_domain 时写黑名单。
     """
@@ -941,7 +993,6 @@ def _poll_verification_loop(
     deadline = started + cfg["window"]
     resend_at = started + cfg["resend_after"]
     resend_done = False
-    empty_streak = 0
     last_raw_len = 0
     attempt = 0
 
@@ -960,7 +1011,6 @@ def _poll_verification_loop(
             )
 
         if content:
-            empty_streak = 0
             if len(content) != last_raw_len:
                 last_raw_len = len(content)
                 print(f"[*] {email} 收到邮件 (len={len(content)})，解析验证码...")
@@ -971,12 +1021,8 @@ def _poll_verification_loop(
                 snippet = re.sub(r"\s+", " ", content)[:180]
                 print(f"[!] {email} 邮件未能解析验证码，snippet: {snippet!r}")
         else:
-            empty_streak += 1
             if attempt % 5 == 1:
                 print(f"[*] {email} 等待验证邮件... (第 {attempt} 次)")
-            if cfg["empty_abort"] > 0 and empty_streak >= cfg["empty_abort"]:
-                print(f"[-] {email} 连续 {empty_streak} 次收件箱为空，提前放弃本轮")
-                return _verify_result("empty_inbox")
 
         # 重发只在冷却（默认 120s）满足后做一次；提前重发会被站点 400 拒绝
         if not resend_done and time.monotonic() >= resend_at:
@@ -1005,13 +1051,12 @@ def poll_verification_code(
         email_service_type: "gptmail" 或其它。
         session: 站点会话；提供时先请求发信，并在冷却满足后重发一次。
         access_token: 站点 access_token，配合 session 使用。
-        config: 覆盖 ``_verify_poll_config()``（测试注入用，避免真等 180s）。
+        config: 覆盖 ``_verify_poll_config()``（测试注入用，避免真等 240s）。
 
     返回:
         ``{"code", "reason", "domain_blocked"}``，reason 取值：
         - "ok"                 拿到验证码；
-        - "timeout"            窗口内始终无可解析验证码；
-        - "empty_inbox"        连续空收件箱达阈值，提前放弃；
+        - "timeout"            窗口内始终未收到可用的验证码；
         - "unsupported_domain" 服务商不支持该域名，已加入黑名单（domain_blocked=True）；
         - "stopped"            用户请求停止。
 
@@ -1160,12 +1205,23 @@ def register_accounts():
                             email, password, access_token, extra="UNVERIFIED"
                         )
                         print(f"[~] 未验证账号 -> {paths['accounts']}")
-                        # 域名不支持 / 收件箱长期为空 / 用户停止：本轮已无意义，直接换号
+                        # 域名不支持 / 窗口等到超时 / 用户停止：本轮已无意义，直接换号
                         time.sleep(3)
                         continue
 
                     print(f"[*] {email} 验证码: {code}")
                     vres = verify_email_http(session, access_token, code)
+                    if not vres["ok"]:
+                        # 重发后箱内可能同时有新老两封邮件，站点会作废旧码：先试的码
+                        # 若是旧的就必然失败，这里把其余验证码也试一遍再放弃。
+                        for alt in _other_verification_codes(
+                            email_service, jwt, email, EMAIL_SERVICE_TYPE, code
+                        ):
+                            print(f"[*] {email} 验证码 {code} 未通过，改试 {alt}")
+                            retry = verify_email_http(session, access_token, alt)
+                            if retry["ok"]:
+                                vres, code = retry, alt
+                                break
                     if not vres["ok"]:
                         print(
                             f"[-] {email} 邮箱验证失败 ({vres['status']}): {vres['message']}"

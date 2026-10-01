@@ -255,16 +255,74 @@ class GPTMailService:
             print(f"[-] 创建邮箱网络异常 ({url}): {e}")
             return None
 
+    def _fetch_email_list(self, email: str) -> list:
+        """
+        拉取邮箱内的邮件列表，按收信时间倒序（最新在前）。
+
+        参数:
+            email: 邮箱地址。
+
+        返回:
+            邮件字典列表；收件箱为空返回空列表。缺少 ``timestamp`` 的邮件按 0
+            处理（排到最后），避免排序抛异常。
+
+        异常:
+            UnsupportedEmailDomain: 服务商返回 400 "Unsupported email domain"（域名被停用）。
+
+        排序原因: 接口返回的列表顺序没有文档保证，而重发验证码后箱内会同时存在
+        新旧两封邮件、且站点会作废旧码，因此按 ``timestamp`` 自己排序取最新那封，
+        不依赖未定义的行为。
+        """
+        url = f"{self.BASE_URL}/api/emails"
+        res = requests.get(
+            url,
+            params={"email": email},
+            headers={"X-API-Key": self.api_key},
+            timeout=self.timeout,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            self._update_usage(data)
+            emails = data.get("data", {}).get("emails", []) or []
+            return sorted(
+                emails, key=lambda item: item.get("timestamp") or 0, reverse=True
+            )
+        if _UNSUPPORTED_DOMAIN_RE.search(res.text or ""):
+            # 域名级硬失败：不再按普通错误打印（否则 45 轮轮询会刷 45 行同样的日志）
+            raise UnsupportedEmailDomain(
+                f"HTTP {res.status_code} {res.text[:120]}"
+            )
+        print(f"[-] 获取邮件失败: {res.status_code} - {res.text}")
+        return []
+
+    def _email_content(self, item: dict):
+        """
+        取单封邮件的正文。
+
+        参数:
+            item: ``_fetch_email_list`` 返回的单个邮件字典。
+
+        返回:
+            正文文本；列表里没带正文时按 ``id`` 再拉一次详情，仍取不到返回 None。
+        """
+        content = item.get("content") or item.get("html_content")
+        if content:
+            return content
+        email_id = item.get("id")
+        if email_id:
+            return self._fetch_email_detail(email_id)
+        return None
+
     def fetch_first_email(self, jwt_unused, email=None):
         """
-        获取邮箱的第一封邮件内容。
+        获取邮箱最新一封邮件的正文。
 
         参数:
             jwt_unused: 兼容 Cloudflare Worker 服务的签名，GPTMail 不使用。
             email: 要读取的邮箱地址，必填；缺失时打印提示并返回 None。
 
         返回:
-            第一封邮件的正文文本（无正文时再取单封详情）；收件箱为空返回 None。
+            最新一封有正文的邮件文本；收件箱为空返回 None。
 
         异常:
             UnsupportedEmailDomain: 服务商返回 400 "Unsupported email domain"（域名被停用）。
@@ -273,39 +331,49 @@ class GPTMailService:
         if not email:
             print("[-] fetch_first_email 需要 email 参数")
             return None
-        url = f"{self.BASE_URL}/api/emails"
         try:
-            res = requests.get(
-                url,
-                params={"email": email},
-                headers={"X-API-Key": self.api_key},
-                timeout=self.timeout,
-            )
-            if res.status_code == 200:
-                data = res.json()
-                self._update_usage(data)
-                emails = data.get("data", {}).get("emails", [])
-                if emails:
-                    first = emails[0]
-                    content = first.get("content") or first.get("html_content")
-                    if content:
-                        return content
-                    email_id = first.get("id")
-                    if email_id:
-                        return self._fetch_email_detail(email_id)
-                return None
-            if _UNSUPPORTED_DOMAIN_RE.search(res.text or ""):
-                # 域名级硬失败：不再按普通错误打印（否则 45 轮轮询会刷 45 行同样的日志）
-                raise UnsupportedEmailDomain(
-                    f"HTTP {res.status_code} {res.text[:120]}"
-                )
-            print(f"[-] 获取邮件失败: {res.status_code} - {res.text}")
+            # 从新到旧找第一封有正文的：最新那封没正文时不该挡住更早的有效邮件
+            for item in self._fetch_email_list(email):
+                content = self._email_content(item)
+                if content:
+                    return content
             return None
         except UnsupportedEmailDomain:
             raise
         except Exception as e:
             print(f"获取邮件失败: {e}")
             return None
+
+    def fetch_inbox_contents(self, email=None) -> list:
+        """
+        拉取邮箱内全部邮件的正文，按收信时间倒序（最新在前）。
+
+        用途: 重发验证码后箱内可能同时有新老两封邮件，若先试的码已被站点作废，
+        可改用本方法取回其余邮件、逐个改试其他验证码，避免白费整轮注册。
+
+        参数:
+            email: 邮箱地址，必填；缺失时返回空列表。
+
+        返回:
+            正文列表（没有正文的邮件会被跳过），最新在前；空箱返回空列表。
+
+        边界条件: 这是尽力而为的兜底路径，除域名级硬失败外的一切异常都吞掉并返回
+        空列表，避免在已经拿到验证码之后反而打断注册流程。
+        """
+        if not email:
+            return []
+        try:
+            contents = []
+            for item in self._fetch_email_list(email):
+                content = self._email_content(item)
+                if content:
+                    contents.append(content)
+            return contents
+        except UnsupportedEmailDomain:
+            raise
+        except Exception as e:
+            print(f"[-] 拉取邮件列表异常: {e}")
+            return []
 
     def _fetch_email_detail(self, email_id):
         """读取单封邮件详情（含正文）"""

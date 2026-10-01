@@ -87,7 +87,7 @@ class TurnstileAPIServer:
         self.console = Console()
 
         # 浏览器按需启停：内存几乎全在浏览器上（每个 camoufox/Firefox 实例数百 MB），
-        # 而注册流程是串行的、两轮求解之间可能隔着几分钟（验证邮件窗口最长 180s）。
+        # 而注册流程是串行的、两轮求解之间可能隔着几分钟（验证邮件窗口最长 240s）。
         # idle_timeout > 0：启动时不起浏览器，首个请求才起；空闲超过该秒数即关闭并释放内存。
         # idle_timeout <= 0：保持旧行为（启动即起、永不释放）。
         self.idle_timeout = float(idle_timeout)
