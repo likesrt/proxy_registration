@@ -61,7 +61,19 @@ logger.addHandler(handler)
 
 class TurnstileAPIServer:
 
-    def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
+    def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None, idle_timeout: float = 600.0):
+        """
+        初始化 Solver 服务。
+
+        参数:
+            headless / useragent / debug / browser_type / proxy_support: 见命令行参数。
+            thread: 浏览器池大小（= 可并发求解的任务数）。本项目注册流程串行，取 1 即可。
+            use_random_config / browser_name / browser_version: chromium 系 UA 配置来源。
+            idle_timeout: 空闲多少秒后关闭浏览器释放内存；>0 同时启用懒加载
+                （启动时不建浏览器，首个请求才建）；<=0 保持旧行为（启动即建、永不释放）。
+
+        副作用: 仅设置状态与注册路由，不启动浏览器（浏览器在 _startup 或首个请求时创建）。
+        """
         self.app = Quart(__name__)
         self.debug = debug
         self.browser_type = browser_type
@@ -73,6 +85,20 @@ class TurnstileAPIServer:
         self.browser_name = browser_name
         self.browser_version = browser_version
         self.console = Console()
+
+        # 浏览器按需启停：内存几乎全在浏览器上（每个 camoufox/Firefox 实例数百 MB），
+        # 而注册流程是串行的、两轮求解之间可能隔着几分钟（验证邮件窗口最长 180s）。
+        # idle_timeout > 0：启动时不起浏览器，首个请求才起；空闲超过该秒数即关闭并释放内存。
+        # idle_timeout <= 0：保持旧行为（启动即起、永不释放）。
+        self.idle_timeout = float(idle_timeout)
+        self.lazy_browsers = self.idle_timeout > 0
+        self._pool_lock = asyncio.Lock()      # 保证同一时刻只有一次浏览器创建/释放
+        self._browsers_ready = False
+        self._next_browser_index = 0          # 单调递增，补齐时不会与在池中的索引重复
+        self._inflight = 0                    # 正在求解的任务数，>0 时不做空闲释放
+        self._last_activity = time.monotonic()
+        self._playwright = None
+        self._camoufox = None
 
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
@@ -143,30 +169,93 @@ class TurnstileAPIServer:
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
         self.display_welcome()
-        logger.info("Starting browser initialization")
         try:
             await init_db()
-            await self._initialize_browser()
+
+            if self.lazy_browsers:
+                # 懒加载：此处不起浏览器（省内存），首个 /turnstile 请求时再起。
+                # 健康检查打的是 '/'（静态页面），不依赖浏览器，所以容器照样能报 healthy。
+                logger.info(
+                    f"懒加载模式：浏览器将在首个请求时启动，"
+                    f"空闲 {self.idle_timeout:.0f}s 后自动关闭释放内存"
+                )
+            else:
+                logger.info("Starting browser initialization")
+                await self._initialize_browser()
 
             # Запускаем периодическую очистку старых результатов
             asyncio.create_task(self._periodic_cleanup())
+
+            if self.lazy_browsers:
+                asyncio.create_task(self._idle_watchdog())
 
         except Exception as e:
             logger.error(f"Failed to initialize browser: {str(e)}")
             raise
 
     async def _initialize_browser(self) -> None:
-        """Initialize the browser and create the page pool."""
-        playwright = None
-        camoufox = None
+        """
+        创建（或补齐）浏览器池，池大小为 ``thread_count``。
 
+        与旧实现的区别：playwright / camoufox 句柄保存在 ``self`` 上，可被
+        ``_release_browsers()`` 关闭后再次创建；且只补齐到 ``thread_count`` 个，
+        因此某个浏览器断开被 ``_return_browser_to_pool`` 丢弃后，
+        下一次 ``_ensure_pool()`` 会自动补上，不会让池慢慢变空。
+        """
+        # 浏览器驱动句柄：已存在则复用（懒加载释放后会置回 None，从而重新创建）
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            playwright = await async_playwright().start()
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+            playwright = self._playwright
+            camoufox = None
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
+            if self._camoufox is None:
+                self._camoufox = AsyncCamoufox(headless=self.headless)
+            camoufox = self._camoufox
+            playwright = None
+        else:
+            playwright = None
+            camoufox = None
 
-        browser_configs = []
-        for _ in range(self.thread_count):
+        missing = self.thread_count - self.browser_pool.qsize()
+        if missing <= 0:
+            self._browsers_ready = True
+            return
+
+        browser_configs = self._build_browser_configs(missing)
+        await self._launch_browsers(browser_configs, playwright, camoufox)
+
+        self._browsers_ready = True
+        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+
+        if self.use_random_config:
+            logger.info(f"Each browser in pool received random configuration")
+        elif self.browser_name and self.browser_version:
+            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
+        else:
+            logger.info("Using custom configuration")
+
+        if self.debug:
+            for i, config in enumerate(browser_configs):
+                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
+                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
+                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+
+    def _build_browser_configs(self, count: int) -> list:
+        """
+        构造 ``count`` 份浏览器配置（UA / sec-ch-ua / 版本）。
+
+        参数:
+            count: 需要补齐的浏览器数量。
+
+        返回:
+            配置字典列表，长度等于 ``count``。
+
+        说明: 分支完全沿用原有逻辑——chromium 系支持 ``--random`` 与
+        ``--browser/--version`` 指定；camoufox 使用默认配置。
+        """
+        configs = []
+        for _ in range(count):
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
                 if self.use_random_config:
                     browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
@@ -190,17 +279,29 @@ class TurnstileAPIServer:
                 useragent = self.useragent
                 sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
-
-            browser_configs.append({
+            configs.append({
                 'browser_name': browser,
                 'browser_version': version,
                 'useragent': useragent,
                 'sec_ch_ua': sec_ch_ua
             })
+        return configs
 
-        for i in range(self.thread_count):
-            config = browser_configs[i]
+    async def _launch_browsers(self, browser_configs: list, playwright, camoufox) -> None:
+        """
+        按配置逐个启动浏览器并放入池中。
 
+        参数:
+            browser_configs: ``_build_browser_configs`` 的结果。
+            playwright / camoufox: 驱动句柄；未启动对应浏览器类型时传 None。
+
+        返回:
+            无。启动成功的浏览器进池；``browser`` 为 None 的（驱动缺失）跳过。
+
+        副作用: 启动浏览器进程（昂贵，单实例数百 MB）；索引用单调计数器分配，
+        避免补齐时与池中已有索引重复。
+        """
+        for config in browser_configs:
             browser_args = [
                 "--window-position=0,0",
                 "--force-device-scale-factor=1"
@@ -219,25 +320,16 @@ class TurnstileAPIServer:
                 browser = await camoufox.start()
 
             if browser:
-                await self.browser_pool.put((i+1, browser, config))
+                self._next_browser_index += 1
+                await self.browser_pool.put(
+                    (self._next_browser_index, browser, config)
+                )
 
             if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
-
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
-
-        if self.use_random_config:
-            logger.info(f"Each browser in pool received random configuration")
-        elif self.browser_name and self.browser_version:
-            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
-        else:
-            logger.info("Using custom configuration")
-
-        if self.debug:
-            for i, config in enumerate(browser_configs):
-                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
-                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
-                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+                logger.info(
+                    f"Browser {self._next_browser_index} initialized successfully "
+                    f"with {config['browser_name']} {config['browser_version']}"
+                )
 
     async def _periodic_cleanup(self):
         """Periodic cleanup of old results every hour"""
@@ -249,6 +341,92 @@ class TurnstileAPIServer:
                     logger.info(f"Cleaned up {deleted_count} old results")
             except Exception as e:
                 logger.error(f"Error during periodic cleanup: {e}")
+
+    async def _ensure_pool(self) -> None:
+        """
+        确保浏览器池可用（懒加载的唯一入口）。
+
+        池已就绪且数量足够时直接返回；否则创建/补齐浏览器。用 ``_pool_lock``
+        串行化，避免多个请求同时到达时重复创建（会把内存翻倍）。
+
+        同时修掉一个既有问题：``_return_browser_to_pool`` 在浏览器断开时不再放回池，
+        旧实现下池只减不增，耗尽后 ``browser_pool.get()`` 会永久阻塞；现在每次
+        求解前都会补齐到 ``thread_count``。
+
+        副作用: 可能启动浏览器（冷启动数秒到数十秒），并写出日志。
+        """
+        async with self._pool_lock:
+            if self._browsers_ready and self.browser_pool.qsize() >= self.thread_count:
+                return
+            if self.browser_pool.qsize() < self.thread_count:
+                logger.info(
+                    f"准备浏览器：池内 {self.browser_pool.qsize()}/{self.thread_count}，"
+                    f"正在创建（首次请求会有冷启动等待）"
+                )
+                await self._initialize_browser()
+
+    async def _release_browsers(self) -> None:
+        """
+        关闭池内全部浏览器并释放内存（空闲回收）。
+
+        调用前提: ``_inflight == 0``，即没有正在求解的任务——否则会关掉任务正在用的浏览器。
+        释放后 ``_browsers_ready`` 复位，下次请求由 ``_ensure_pool`` 重新创建。
+        逐个 close 并吞掉单个失败，保证一个浏览器关不掉不会阻断整体释放。
+        """
+        async with self._pool_lock:
+            closed = 0
+            while not self.browser_pool.empty():
+                try:
+                    _index, browser, _config = self.browser_pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    await browser.close()
+                    closed += 1
+                except Exception as e:
+                    logger.warning(f"关闭浏览器失败（忽略）: {str(e)[:120]}")
+
+            # 驱动句柄也要关，否则 Firefox/Chromium 的辅助进程可能残留
+            if self._playwright is not None:
+                try:
+                    await self._playwright.stop()
+                except Exception as e:
+                    logger.warning(f"停止 playwright 失败（忽略）: {str(e)[:120]}")
+                self._playwright = None
+            self._camoufox = None
+
+            self._browsers_ready = False
+            self._next_browser_index = 0
+            if closed:
+                logger.info(f"空闲回收：已关闭 {closed} 个浏览器并释放内存")
+
+    def _idle_check_interval(self) -> float:
+        """
+        看门狗检查间隔：``idle_timeout`` 的 1/10，限制在 1~60 秒。
+
+        取 1/10 是为了让释放时机与超时值同量级；上下限避免空转（<1s）或反应过慢（>60s）。
+        抽成方法便于单测覆写，避免测试真等几十秒。
+        """
+        return max(1.0, min(60.0, self.idle_timeout / 10.0))
+
+    async def _idle_watchdog(self) -> None:
+        """
+        空闲看门狗：连续 ``idle_timeout`` 秒没有求解任务就关闭浏览器释放内存。
+
+        仅在懒加载模式（``idle_timeout > 0``）下启动。先 sleep 再检查，
+        所以不会在服务刚起来、还没接到请求时就把浏览器回收掉。
+        """
+        interval = self._idle_check_interval()
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if self._inflight > 0 or not self._browsers_ready:
+                    continue
+                idle_for = time.monotonic() - self._last_activity
+                if idle_for >= self.idle_timeout:
+                    await self._release_browsers()
+            except Exception as e:
+                logger.error(f"空闲回收异常（忽略，下轮重试）: {str(e)[:160]}")
 
     async def _antishadow_inject(self, page):
         await page.add_init_script("""
@@ -694,9 +872,16 @@ class TurnstileAPIServer:
         context = None
         start_time = time.time()
 
-        index, browser, browser_config = await self.browser_pool.get()
+        # 先登记 in-flight：看门狗据此判断"有任务在跑"，不会把浏览器回收掉
+        self._inflight += 1
+        self._last_activity = time.monotonic()
+        index = None
+        browser = None
+        browser_config = None
 
         try:
+            await self._ensure_pool()
+            index, browser, browser_config = await self.browser_pool.get()
             try:
                 if hasattr(browser, 'is_connected') and not browser.is_connected():
                     if self.debug:
@@ -852,7 +1037,12 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.warning(f"Browser {index}: Error closing context: {str(e)}")
 
-            await self._return_browser_to_pool(index, browser, browser_config)
+            # 懒加载或补齐失败时可能没取到浏览器，此时无事可归还
+            if browser is not None:
+                await self._return_browser_to_pool(index, browser, browser_config)
+
+            self._inflight -= 1
+            self._last_activity = time.monotonic()
 
 
 
@@ -1017,11 +1207,12 @@ def parse_args():
     parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
+    parser.add_argument('--idle-timeout', type=float, default=600.0, help='Seconds of inactivity after which browsers are closed to free memory; browsers are also started lazily on the first request. 0 disables both (old behavior: start at boot, never release). (default: 600)')
     return parser.parse_args()
 
 
-def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool, browser_name: str, browser_version: str) -> Quart:
-    server = TurnstileAPIServer(headless=headless, useragent=useragent, debug=debug, browser_type=browser_type, thread=thread, proxy_support=proxy_support, use_random_config=use_random_config, browser_name=browser_name, browser_version=browser_version)
+def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool, browser_name: str, browser_version: str, idle_timeout: float = 600.0) -> Quart:
+    server = TurnstileAPIServer(headless=headless, useragent=useragent, debug=debug, browser_type=browser_type, thread=thread, proxy_support=proxy_support, use_random_config=use_random_config, browser_name=browser_name, browser_version=browser_version, idle_timeout=idle_timeout)
     return server.app
 
 
@@ -1045,6 +1236,7 @@ if __name__ == '__main__':
             proxy_support=args.proxy,
             use_random_config=args.random,
             browser_name=args.browser,
-            browser_version=args.version
+            browser_version=args.version,
+            idle_timeout=args.idle_timeout
         )
         app.run(host=args.host, port=int(args.port))

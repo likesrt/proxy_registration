@@ -7,8 +7,11 @@ services:
         REPO_URL: https://github.com/likesrt/proxy_registration
         REPO_REF: main
         # GITHUB_TOKEN: ""     # 仓库为私有时才需要
+    # --thread 1：注册流程是串行的，同一时刻只有一个 Turnstile 请求，
+    #             多开的浏览器只会白占内存（每个 camoufox 实例数百 MB）
+    # --idle-timeout 600：浏览器首个请求时才启动，空闲 10 分钟自动关闭释放内存；0 = 关闭该特性
     command: ["python", "api_solver.py", "--browser_type", "camoufox",
-              "--thread", "2"]
+              "--thread", "1", "--idle-timeout", "600"]
     restart: unless-stopped
     mem_limit: 4g
     shm_size: 1g

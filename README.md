@@ -307,6 +307,21 @@ python api_solver.py --browser_type camoufox --thread 1 --debug
 
 默认监听 `http://0.0.0.0:5072`（可用 `--host` / `--port` 修改）。Solver 未启动时注册会因验证码失败而停止。
 
+#### 内存占用：`--thread` 与懒加载
+
+浏览器是内存大户（每个 camoufox/Firefox 实例数百 MB），而**注册流程是串行的**——`register_accounts` 单线程跑，同一时刻只有一个 Turnstile 请求。所以 `--thread` 保持 **1** 即可，多开只是白占内存。
+
+`--idle-timeout`（默认 `600` 秒）让浏览器**按需启动、空闲释放**：
+
+- 启动 solver 时**不创建**浏览器，第一个 `/turnstile` 请求到达时才启动（首个请求会有几秒到几十秒的冷启动等待，`turnstile_service.get_response` 的 ~65 秒轮询窗口足以覆盖）；
+- 连续 `--idle-timeout` 秒没有求解任务就关闭浏览器并释放内存，下次请求再起；
+- 健康检查打的是 `/`（静态页面），不依赖浏览器，所以容器始终报 healthy，compose 无需改动；
+- `--idle-timeout 0` 恢复旧行为（启动即创建、永不释放）。
+
+默认 600 秒是刻意取的：注册时每个账号求解完 Turnstile 后还要走注册、验证邮件（最长 180 秒）、问卷与试用，两轮求解间隔可能有几分钟；600 秒能保证一整轮注册期间浏览器保持热态，又能在收工后 10 分钟内释放。
+
+> 副作用提示：如果注册任务之间间隔超过 `--idle-timeout`，每隔一段时间会付一次冷启动开销。想一直热着就调大该值（或设 0）。
+
 #### 分机部署（推荐：Solver 与注册分开）
 
 完全可以：一台只跑 Solver，另一台只跑 `main.py` / `web_app.py`。
@@ -320,7 +335,7 @@ python api_solver.py --browser_type camoufox --thread 1 --debug
 
 ```bash
 # 监听所有网卡，便于 B 访问（默认 host 已是 0.0.0.0）
-python api_solver.py --host 0.0.0.0 --port 5072 --browser_type camoufox --thread 2
+python api_solver.py --host 0.0.0.0 --port 5072 --browser_type camoufox --thread 1
 ```
 
 防火墙放行 **TCP 5072**（仅内网更安全）。
@@ -454,6 +469,7 @@ ProxyScrape/
     ├── test_feed_and_auto_register.py
     ├── test_email_blacklist.py
     ├── test_verification_poll.py
+    ├── test_solver_lazy_browser.py
     └── test_gptmail_service.py
 ```
 
